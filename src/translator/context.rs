@@ -31,6 +31,10 @@ pub struct TranslationContext<'a> {
     pub known_columns: indexmap::IndexMap<String, Vec<String>>,
     /// Nested join info: maps binding name -> (left_table, right_table, right_key_col, new_col_name).
     pub nested_joins: indexmap::IndexMap<String, NestedJoinInfo>,
+    /// Set of binding names in the current `let` expression (for Table.Combine validation).
+    pub combine_bindings: std::collections::HashSet<String>,
+    /// Set of input file stems from CLI arguments (for cross-file Table.Combine validation).
+    pub input_file_stems: std::collections::HashSet<String>,
 }
 
 /// Information about a nested join for ExpandTableColumn resolution.
@@ -70,6 +74,8 @@ impl<'a> TranslationContext<'a> {
             has_errors: false,
             known_columns: indexmap::IndexMap::new(),
             nested_joins: indexmap::IndexMap::new(),
+            combine_bindings: std::collections::HashSet::new(),
+            input_file_stems: std::collections::HashSet::new(),
         }
     }
 

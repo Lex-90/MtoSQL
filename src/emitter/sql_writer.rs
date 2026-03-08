@@ -38,6 +38,8 @@ pub struct SelectStmt {
     pub order_by: Vec<OrderByItem>,
     /// LIMIT value.
     pub limit: Option<u64>,
+    /// UNION ALL members (additional SELECT statements to combine).
+    pub union_all: Vec<SelectStmt>,
 }
 
 impl SelectStmt {
@@ -52,6 +54,7 @@ impl SelectStmt {
             having: None,
             order_by: Vec::new(),
             limit: None,
+            union_all: Vec::new(),
         }
     }
 }
@@ -108,6 +111,11 @@ pub enum SelectCol {
         expr: SqlExpr,
         /// Optional alias.
         alias: Option<String>,
+    },
+    /// `* EXCEPT (col1, col2, ...)` — used by BigQuery and DuckDB.
+    Except {
+        /// Columns to exclude.
+        columns: Vec<String>,
     },
 }
 
@@ -375,6 +383,12 @@ fn write_select(stmt: &SelectStmt, dialect: &dyn Dialect) -> String {
         out.push_str(&format!("\nLIMIT {}", limit));
     }
 
+    // UNION ALL
+    for union_stmt in &stmt.union_all {
+        out.push_str("\nUNION ALL\n");
+        out.push_str(&write_select(union_stmt, dialect));
+    }
+
     out
 }
 
@@ -390,6 +404,9 @@ fn write_select_col(col: &SelectCol, dialect: &dyn Dialect) -> String {
             } else {
                 expr_str
             }
+        }
+        SelectCol::Except { columns } => {
+            format!("* EXCEPT ({})", columns.join(", "))
         }
     }
 }
