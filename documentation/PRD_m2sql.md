@@ -1,11 +1,16 @@
 # PRD: `m2sql` — M Code to SQL CLI Translator
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 **Status:** Ready for implementation
 **Runtime:** Rust (stable toolchain)
 **Audience:** Claude Code (AI coding agent)
 
-> **Changelog from v1.0.0**
+> **Changelog from v1.1.0**
+> - §5.2: Documented indentation-based `source =` block format for TMDL files (in addition to backtick-delimited blocks).
+> - §11.3: Added `tmdl_indent.tmdl` fixture for indentation-based TMDL source blocks.
+> - §15: Added acceptance criterion for indentation-based TMDL parsing.
+>
+> **Changelog from v1.0.0 → v1.1.0**
 > - §3.4: Added missing flags `--query-name`, `--inline-singles`, `--log-json`; clarified `--stdout` separator format.
 > - §5.1: Documented M section syntax (`section … ; shared …`) and its output mapping.
 > - §6.3: Added `Text.EndsWith` → `LIKE '%v'` translation (was listed as supported but never specced).
@@ -219,7 +224,9 @@ in Data;
 Output: **one `.sql` file per `shared` binding**, named after the binding name (e.g. `Orders.sql`, `Customers.sql`). Non-`shared` (private) bindings within the section are treated as internal helpers and are not emitted as top-level queries; if a `shared` binding references a private one, the private expression is inlined or emitted as a CTE within the referencing query's output file.
 
 ### 5.2 `.tmdl` files (Power BI `.pbip` projects)
-TMDL (Tabular Model Definition Language) files contain M partition expressions inside `m` blocks. Example structure:
+TMDL (Tabular Model Definition Language) files contain M partition expressions inside `m` blocks. Two source block formats are supported:
+
+**Backtick-delimited source blocks** — the M code is enclosed in `` ``` … ``` ``:
 
 ```tmdl
 table Sales
@@ -234,7 +241,25 @@ table Sales
         ```
 ```
 
-The parser must extract the content of each ` ``` … ``` ` block tagged as `source =` within a partition definition and treat it as an M expression. The enclosing `table <n>` value is used as the output file name.
+**Indentation-based source blocks** — the `source =` line ends with `=` and the M code follows on subsequent lines indented deeper than the `source` line:
+
+```tmdl
+table D_Agenti
+    partition D_Agenti = m
+        mode: import
+        queryGroup: Dimensions
+        source =
+                let
+                    Origine = Sql.Database(sql_server, sql_db),
+                    dbo_V_PBI_ANAG_AGENTI = Origine{[Schema="dbo",Item="V_PBI_ANAG_AGENTI"]}[Data],
+                    #"Rimosse colonne" = Table.RemoveColumns(dbo_V_PBI_ANAG_AGENTI,{"PARTITA_IVA", "COD_SDI", "PEC"})
+                in
+                    #"Rimosse colonne"
+```
+
+For both formats, the parser extracts the M source from within the `source =` block and treats it as an M expression. The enclosing `table <n>` value is used as the output file name.
+
+The indentation-based format is the native format used by Power BI Desktop when exporting `.pbip` projects. The block ends when a line at the same or lesser indentation level as the `source` keyword is encountered, or at end of file.
 
 ### 5.3 Stdin
 Raw M code (single `let … in` expression). The query is named `query` by default; override with `--query-name <n>`.
@@ -658,7 +683,8 @@ Run: `cargo test` and `cargo insta review` for snapshot approval.
 | `cast_types.pq` | `Table.TransformColumnTypes` — all supported M types per dialect |
 | `multi_step.pq` | Full `let … in` pipeline → CTE chain |
 | `section_syntax.pq` | M section syntax — multiple `shared` bindings → separate `.sql` files |
-| `tmdl_table.tmdl` | TMDL file with embedded M partition |
+| `tmdl_table.tmdl` | TMDL file with backtick-delimited M partition |
+| `tmdl_indent.tmdl` | TMDL file with indentation-based M partition |
 | `untranslatable.pq` | Unknown function → all three `--on-error` modes |
 | `stdin_query` | (tested via CLI process spawn with `--query-name`) |
 
@@ -718,7 +744,7 @@ No network-capable crates. No async runtime required (all I/O is synchronous fil
 
 ## 15. Acceptance Criteria
 
-- [ ] All 19 test fixtures translate without errors for all 5 dialects.
+- [ ] All 20 test fixtures translate without errors for all 5 dialects.
 - [ ] All snapshot tests pass (`cargo insta test`).
 - [ ] `--on-error fail` processes all files, then exits with code 1; no partial `.sql` written for errored files.
 - [ ] `--on-error comment` exits with code 0 and embeds `/* UNTRANSLATABLE: … */`.
@@ -729,6 +755,7 @@ No network-capable crates. No async runtime required (all I/O is synchronous fil
 - [ ] Section-syntax `.pq` files produce one `.sql` per `shared` binding.
 - [ ] `Table.RenameColumns` produces correct column aliases for all 5 dialects.
 - [ ] `Table.ExpandTableColumn` is correctly absorbed into the preceding `NestedJoin` CTE.
+- [ ] Indentation-based TMDL `source =` blocks are parsed correctly alongside backtick-delimited blocks.
 - [ ] Determinism test passes (100 runs, byte-identical output).
 - [ ] `cargo clippy -- -D warnings` produces zero warnings.
 - [ ] `cargo test` passes on Linux, macOS, and Windows.
