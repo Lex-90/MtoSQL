@@ -1,10 +1,14 @@
 # NFR: `m2sql` — Non-Functional Requirements
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Ready for implementation
 **Companion doc:** `PRD_m2sql.md`
 **Runtime:** Rust (stable toolchain, MSRV 1.75)
 
+> **Changelog from v1.2.0**
+> - §2.5: New — Cross-file reference validation for `Table.Combine`: resolver must hold input file stems until all files are parsed before running the combine-table resolution pass.
+> - Appendix A: Added `NFR-FEAT-04` (`Table.RemoveColumns`) and `NFR-FEAT-05` (`Table.Combine`) traceability entries.
+>
 > **Changelog from v1.1.0**
 > - §2.2: Added note on TMDL indentation-based source block parsing fidelity.
 > - Appendix A: Added `NFR-FEAT-03` traceability entry for indentation-based TMDL parsing.
@@ -91,6 +95,20 @@ If a CTE step or column cannot be translated, it must either:
 - Produce a `/* UNTRANSLATABLE: … */` placeholder comment.
 
 Silently dropping steps or columns is never acceptable.
+
+### 2.5 Cross-file reference validation (`Table.Combine`)
+
+`Table.Combine` introduces a resolver-level constraint that is evaluated **after** all input files have been parsed, because the full set of valid table identifiers is only known once every CLI argument has been processed.
+
+**Requirements:**
+
+- The pipeline must collect the file stem of every input file (e.g. `Customers` from `Customers.pq`) into a shared, immutable set before the `resolve_combine_tables` pass begins.
+- The `resolve_combine_tables` pass iterates over every `Table.Combine` call site found during parsing and asserts that each member identifier resolves to either a `let`-binding in the same query or a member of the input-file stem set.
+- This two-phase approach (parse all → then validate combines) must not break the `§2.3` error-isolation guarantee: an `UNRESOLVED_COMBINE_TABLE` error in one file does not prevent other files from being translated.
+- The input-file stem set must be built from the **original CLI arguments** (or glob expansion), not from output filenames or any mutable state. It is read-only during the resolution pass.
+- When reading from stdin, the input-file stem set is empty; only same-`let` bindings are valid combine targets.
+
+**Determinism note:** The set of valid file stems must be sorted lexicographically before the validation pass to ensure identical error ordering regardless of filesystem enumeration order (per `§2.1`).
 
 ---
 
@@ -429,3 +447,5 @@ CI runs on: `ubuntu-latest`, `windows-latest`, `macos-13` (Intel runner).
 | NFR-FEAT-01 | `Table.RenameColumns` | §6.9 (PRD) | Snapshot tests (`rename_cols.pq`) |
 | NFR-FEAT-02 | `Table.ExpandTableColumn` | §6.10 (PRD) | Snapshot tests (`nested_join.pq`) |
 | NFR-FEAT-03 | TMDL indentation-based source blocks | §5.2 (PRD) | Integration test (`tmdl_indent.tmdl`) |
+| NFR-FEAT-04 | `Table.RemoveColumns` | §6.11 (PRD) | Snapshot tests (`remove_cols.pq`); dialect matrix covering `bigquery`/`duckdb` (`EXCEPT`) and `tsql`/`postgres`/`snowflake` (explicit projection); fallback warning test for unknown column set |
+| NFR-FEAT-05 | `Table.Combine` cross-file validation | §6.12 (PRD) | Integration tests (`combine_tables.pq`): (a) same-`let` bindings only; (b) valid cross-file reference to `Customers.pq`; (c) unresolved identifier → `UNRESOLVED_COMBINE_TABLE` error; (d) stdin mode → only `let` bindings accepted |

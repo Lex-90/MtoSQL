@@ -1,10 +1,16 @@
 # PRD: `m2sql` — M Code to SQL CLI Translator
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Status:** Ready for implementation
 **Runtime:** Rust (stable toolchain)
 **Audience:** Claude Code (AI coding agent)
 
+> **Changelog from v1.2.0**
+> - §6.11: New — `Table.RemoveColumns` → dialect-aware column exclusion (`SELECT * EXCEPT` or explicit projection).
+> - §6.12: New — `Table.Combine` → `UNION ALL`, with resolver-level validation that every referenced table is either a binding in the same `let` expression or the stem of an input file supplied on the CLI.
+> - §11.3: Added `remove_cols.pq` and `combine_tables.pq` fixtures.
+> - §15: Added acceptance criteria for `Table.RemoveColumns` and `Table.Combine`.
+>
 > **Changelog from v1.1.0**
 > - §5.2: Documented indentation-based `source =` block format for TMDL files (in addition to backtick-delimited blocks).
 > - §11.3: Added `tmdl_indent.tmdl` fixture for indentation-based TMDL source blocks.
@@ -487,6 +493,122 @@ Expanded AS (
 SELECT * FROM Expanded;
 ```
 
+### 6.11 `Table.RemoveColumns` → column exclusion in `SELECT`
+
+```m
+Table.RemoveColumns(table, {"Col1", "Col2", ...})
+```
+
+Translates to a `SELECT` that returns every column of `table` **except** the listed columns. Because SQL has no universally portable `SELECT * EXCEPT (…)` syntax, the translation strategy is dialect-dependent:
+
+| Dialect | Strategy |
+|---|---|
+| `bigquery` | `SELECT * EXCEPT (Col1, Col2)` — natively supported |
+| `duckdb` | `SELECT * EXCEPT (Col1, Col2)` — natively supported |
+| `tsql` | Explicit column list: `SELECT ColA, ColB, … FROM <table>` (columns that are **not** in the remove list) |
+| `postgres` | Explicit column list (same as T-SQL) |
+| `snowflake` | Explicit column list (same as T-SQL; Snowflake does not support `EXCEPT` in `SELECT *`) |
+
+**Column list resolution:** To emit an explicit projection, the translator must know the full column set of the input table. The resolver attempts to infer this from the preceding CTE step. If the full column list cannot be determined statically (e.g. the source is an unresolved `/* SOURCE: … */` placeholder):
+- Emit `/* WARN: full column list unknown; RemoveColumns translated as EXCEPT clause */` and fall back to `SELECT * EXCEPT (Col1, Col2)` regardless of dialect.
+- If the dialect does not support `EXCEPT`, emit `/* UNTRANSLATABLE: RemoveColumns on unknown column set for dialect <d> */` and apply the configured `--on-error` behaviour.
+
+**Example M:**
+```m
+Table.RemoveColumns(Orders, {"InternalCode", "AuditTimestamp"})
+```
+
+**Expected SQL (tsql / postgres / snowflake — full column list known as `{OrderID, CustomerID, Amount, InternalCode, AuditTimestamp}`):**
+```sql
+SELECT OrderID, CustomerID, Amount
+FROM Orders
+```
+
+**Expected SQL (bigquery / duckdb — or fallback when column list is unknown):**
+```sql
+SELECT * EXCEPT (InternalCode, AuditTimestamp)
+FROM Orders
+```
+
+### 6.12 `Table.Combine` → `UNION ALL`
+
+```m
+Table.Combine({Table1, Table2, Table3, ...})
+```
+
+Translates to a `UNION ALL` of all listed tables. Column alignment follows M semantics: columns are matched by name, not position; missing columns in any member table are filled with `NULL`.
+
+**Translation:**
+```sql
+SELECT * FROM Table1
+UNION ALL
+SELECT * FROM Table2
+UNION ALL
+SELECT * FROM Table3
+```
+
+If column sets differ across the combined tables and the full column list can be statically determined, the translator emits explicit column lists with `NULL AS <missing_col>` fill-ins per member. When the column set is not statically known, `SELECT *` per member is emitted with a warning comment.
+
+#### Cross-file reference validation (resolver requirement)
+
+> [!IMPORTANT]
+> Every table identifier passed inside the list argument to `Table.Combine` **must** resolve to one of the following:
+> 1. A binding defined in the same `let … in` expression (i.e. a CTE name that appears earlier in the same binding chain), or
+> 2. The file stem of one of the input files supplied on the CLI for the current run (e.g. a file `Customers.pq` satisfies a reference to the identifier `Customers`).
+
+If a referenced identifier cannot be resolved against either source, the tool must:
+- Emit an `UNRESOLVED_COMBINE_TABLE` error/warning identifying the file, line number, and the unresolved identifier.
+- Apply the configured `--on-error` behaviour (fail / comment / warn) for that individual unresolved reference.
+- Under `comment` or `warn` modes, replace the unresolvable member with `/* UNRESOLVED: <identifier> */` and continue.
+
+This validation is performed in `src/resolver/source.rs` as a new `resolve_combine_tables` pass that runs after the per-file resolver has completed for all input files, so it has access to the full set of input file stems.
+
+**CLI context note:** When reading from stdin (no file arguments), there are no input file stems to validate against; `Table.Combine` members must be bindings within the same `let` expression, or they are flagged as unresolved.
+
+**Example M (valid — both `Orders` and `Returns` are bindings in the same `let`):**
+```m
+let
+    Source  = Sql.Database("srv", "db"),
+    Orders  = Source{[Name="Orders"]}[Data],
+    Returns = Source{[Name="Returns"]}[Data],
+    All     = Table.Combine({Orders, Returns})
+in
+    All
+```
+
+**Expected SQL:**
+```sql
+WITH Orders AS (
+    SELECT * FROM db.Orders
+),
+Returns AS (
+    SELECT * FROM db.Returns
+),
+All AS (
+    SELECT * FROM Orders
+    UNION ALL
+    SELECT * FROM Returns
+)
+SELECT * FROM All;
+```
+
+**Example M (valid — `Customers.pq` is among the CLI input files):**
+```m
+-- In file: Orders.pq, CLI call: m2sql Orders.pq Customers.pq
+let
+    Source = Sql.Database("srv", "db"),
+    Orders = Source{[Name="Orders"]}[Data],
+    Combined = Table.Combine({Orders, Customers})  -- Customers resolved from Customers.pq
+in
+    Combined
+```
+
+**Example M (invalid — `ExternalFeed` is neither a binding nor an input file):**
+```m
+Table.Combine({Orders, ExternalFeed})
+-- ERROR: UNRESOLVED_COMBINE_TABLE — 'ExternalFeed' is not a binding or a known input file stem
+```
+
 ---
 
 ## 7. Error Handling
@@ -685,6 +807,8 @@ Run: `cargo test` and `cargo insta review` for snapshot approval.
 | `section_syntax.pq` | M section syntax — multiple `shared` bindings → separate `.sql` files |
 | `tmdl_table.tmdl` | TMDL file with backtick-delimited M partition |
 | `tmdl_indent.tmdl` | TMDL file with indentation-based M partition |
+| `remove_cols.pq` | `Table.RemoveColumns` — known column set (explicit projection) and unknown column set (EXCEPT fallback) |
+| `combine_tables.pq` | `Table.Combine` — same-`let` bindings; cross-file references (valid and unresolved) |
 | `untranslatable.pq` | Unknown function → all three `--on-error` modes |
 | `stdin_query` | (tested via CLI process spawn with `--query-name`) |
 
@@ -744,7 +868,7 @@ No network-capable crates. No async runtime required (all I/O is synchronous fil
 
 ## 15. Acceptance Criteria
 
-- [ ] All 20 test fixtures translate without errors for all 5 dialects.
+- [ ] All 22 test fixtures translate without errors for all 5 dialects.
 - [ ] All snapshot tests pass (`cargo insta test`).
 - [ ] `--on-error fail` processes all files, then exits with code 1; no partial `.sql` written for errored files.
 - [ ] `--on-error comment` exits with code 0 and embeds `/* UNTRANSLATABLE: … */`.
@@ -755,6 +879,10 @@ No network-capable crates. No async runtime required (all I/O is synchronous fil
 - [ ] Section-syntax `.pq` files produce one `.sql` per `shared` binding.
 - [ ] `Table.RenameColumns` produces correct column aliases for all 5 dialects.
 - [ ] `Table.ExpandTableColumn` is correctly absorbed into the preceding `NestedJoin` CTE.
+- [ ] `Table.RemoveColumns` emits `SELECT * EXCEPT` for `bigquery`/`duckdb` and explicit column projection for `tsql`/`postgres`/`snowflake` when the column set is known; falls back to `EXCEPT` with a warning when the column set is unknown.
+- [ ] `Table.Combine` emits correct `UNION ALL` for bindings within the same `let` expression.
+- [ ] `Table.Combine` resolves cross-file table references against CLI input file stems and emits `UNRESOLVED_COMBINE_TABLE` errors/warnings for any reference that matches neither a binding nor an input file stem.
+- [ ] `Table.Combine` on stdin input (no file arguments) validates members against `let` bindings only; unmatched identifiers are flagged as unresolved.
 - [ ] Indentation-based TMDL `source =` blocks are parsed correctly alongside backtick-delimited blocks.
 - [ ] Determinism test passes (100 runs, byte-identical output).
 - [ ] `cargo clippy -- -D warnings` produces zero warnings.
