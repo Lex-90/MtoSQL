@@ -1,9 +1,24 @@
 # PRD: `m2sql` — M Code to SQL CLI Translator
 
-**Version:** 1.0.0  
-**Status:** Ready for implementation  
-**Runtime:** Rust (stable toolchain)  
+**Version:** 1.1.0
+**Status:** Ready for implementation
+**Runtime:** Rust (stable toolchain)
 **Audience:** Claude Code (AI coding agent)
+
+> **Changelog from v1.0.0**
+> - §3.4: Added missing flags `--query-name`, `--inline-singles`, `--log-json`; clarified `--stdout` separator format.
+> - §5.1: Documented M section syntax (`section … ; shared …`) and its output mapping.
+> - §6.3: Added `Text.EndsWith` → `LIKE '%v'` translation (was listed as supported but never specced).
+> - §6.4: Corrected `Table.SelectColumns` rename syntax (the `each [OldName]` form does not exist in M); column rename is now a separate function — see new §6.9.
+> - §6.6: Split `List.Count` / `Table.RowCount` into distinct rows with correct SQL mappings.
+> - §6.9: New — `Table.RenameColumns` → `SELECT OldName AS NewName`.
+> - §6.10: New — `Table.ExpandTableColumn` → column projections in JOIN output.
+> - §7: Corrected `--on-error fail` semantics from "halt on first error" to "report-and-exit after processing all files".
+> - §8: Added output naming rule for section-syntax shared bindings.
+> - §9: Added `identifier_close_quote()` to `Dialect` trait to support T-SQL `[…]` bracket quoting.
+> - §11.3: Added `rename_cols.pq` and `section_syntax.pq` fixtures; updated fixture descriptions.
+> - §12: Moved `insta` to `[dev-dependencies]` only; added `criterion` to `[dev-dependencies]`.
+> - §15: Updated acceptance criteria fixture count.
 
 ---
 
@@ -58,7 +73,10 @@ m2sql [OPTIONS] [INPUT...]
 | `--dialect` | `-d` | enum | *(required)* | Target SQL dialect. One of: `tsql`, `postgres`, `bigquery`, `snowflake`, `duckdb`. |
 | `--output-dir` | `-o` | path | `./output` | Directory where `.sql` files are written. Created if absent. |
 | `--on-error` | `-e` | enum | `warn` | Behaviour when an untranslatable expression is encountered. One of: `fail`, `comment`, `warn`. See §7. |
-| `--stdout` | | bool flag | false | Print all SQL to stdout instead of writing files. Queries are separated by `-- [query: <name>]` banners. |
+| `--stdout` | | bool flag | false | Print all SQL to stdout instead of writing files. Queries are separated by `-- [query: <name>]` banners, where `<name>` is the query name / output file stem (e.g. `-- [query: Sales]`). |
+| `--query-name` | `-n` | string | `query` | Name for the query when reading from stdin. Used as the output file stem. Ignored when `INPUT` file arguments are provided. |
+| `--inline-singles` | | bool flag | false | Inline CTE bindings that are referenced exactly once directly into the referencing expression, instead of emitting a named CTE for them. Off by default; opt-in optimisation. |
+| `--log-json` | | bool flag | false | Emit all diagnostic output (warnings, errors, summary) as newline-delimited JSON objects to stderr instead of plain text. Field schema defined in §8 of the NFR. |
 | `--no-color` | | bool flag | false | Disable ANSI colour in terminal output. |
 | `--version` | `-V` | | | Print version and exit. |
 | `--help` | `-h` | | | Print help and exit. |
@@ -80,12 +98,18 @@ m2sql --dialect duckdb Sales.pq
 # Translate all .tmdl files in a directory to Snowflake SQL, fail on any error
 m2sql --dialect snowflake --on-error fail model/tables/*.tmdl
 
-# Pipe M code from stdin and print to stdout
+# Pipe M code from stdin and print to stdout, naming the query
 echo 'let Source = Sql.Database("srv","db"), T = Source{[Name="Orders"]}[Data] in T' \
-  | m2sql --dialect postgres --stdout
+  | m2sql --dialect postgres --stdout --query-name Orders
 
 # Translate a directory of .m files with BigQuery dialect, output to /tmp/sql
 m2sql --dialect bigquery --output-dir /tmp/sql queries/*.m
+
+# JSON log output, useful for CI log parsing
+m2sql --dialect tsql --log-json model/tables/*.tmdl
+
+# Enable single-use CTE inlining
+m2sql --dialect duckdb --inline-singles Sales.pq
 ```
 
 ---
@@ -96,6 +120,7 @@ m2sql --dialect bigquery --output-dir /tmp/sql queries/*.m
 m2sql/
 ├── Cargo.toml
 ├── Cargo.lock
+├── rust-toolchain.toml          # Pins the exact Rust toolchain version
 ├── README.md
 ├── src/
 │   ├── main.rs              # CLI entry point (clap)
@@ -129,13 +154,24 @@ m2sql/
 │   └── error.rs             # Error and Warning types
 ├── tests/
 │   ├── fixtures/            # .pq / .tmdl input files
-│   │   ├── select_rows.pq
-│   │   ├── join.pq
-│   │   ├── group_by.pq
+│   │   ├── select_rows_simple.pq
+│   │   ├── select_rows_text.pq
+│   │   ├── select_rows_list.pq
+│   │   ├── select_cols.pq
+│   │   ├── rename_cols.pq
+│   │   ├── join_inner.pq
+│   │   ├── join_left.pq
+│   │   ├── join_anti.pq
+│   │   ├── join_composite.pq
+│   │   ├── nested_join.pq
+│   │   ├── group_basic.pq
+│   │   ├── group_multi.pq
 │   │   ├── add_column.pq
-│   │   ├── cast.pq
+│   │   ├── cast_types.pq
 │   │   ├── multi_step.pq
-│   │   └── tmdl_table.tmdl
+│   │   ├── section_syntax.pq
+│   │   ├── tmdl_table.tmdl
+│   │   └── untranslatable.pq
 │   ├── snapshots/           # Expected .sql output per dialect
 │   │   ├── tsql/
 │   │   ├── postgres/
@@ -154,7 +190,33 @@ m2sql/
 ## 5. Input Formats
 
 ### 5.1 `.pq` / `.m` files
-Standard Power Query M source files. One file may contain one top-level `let … in` expression or a named query section (`section <name>; shared <name> = …`).
+
+Two sub-formats are supported:
+
+**Single `let … in` expression** — the entire file is one M expression:
+```m
+let
+    Source = Sql.Database("srv", "db"),
+    Orders = Source{[Name="Orders"]}[Data]
+in
+    Orders
+```
+Output: one `.sql` file named after the input file stem (e.g. `Orders.pq` → `Orders.sql`).
+
+**Section syntax with `shared` bindings** — the file begins with a `section` declaration and contains one or more named, exported queries:
+```m
+section MyQueries;
+shared Orders = let
+    Source = Sql.Database("srv", "db"),
+    Data   = Source{[Name="Orders"]}[Data]
+in Data;
+
+shared Customers = let
+    Source = Sql.Database("srv", "db"),
+    Data   = Source{[Name="Customers"]}[Data]
+in Data;
+```
+Output: **one `.sql` file per `shared` binding**, named after the binding name (e.g. `Orders.sql`, `Customers.sql`). Non-`shared` (private) bindings within the section are treated as internal helpers and are not emitted as top-level queries; if a `shared` binding references a private one, the private expression is inlined or emitted as a CTE within the referencing query's output file.
 
 ### 5.2 `.tmdl` files (Power BI `.pbip` projects)
 TMDL (Tabular Model Definition Language) files contain M partition expressions inside `m` blocks. Example structure:
@@ -172,10 +234,10 @@ table Sales
         ```
 ```
 
-The parser must extract the content of each ` ``` … ``` ` block tagged as `source =` within a partition definition and treat it as an M expression. The enclosing `table <name>` value is used as the output file name.
+The parser must extract the content of each ` ``` … ``` ` block tagged as `source =` within a partition definition and treat it as an M expression. The enclosing `table <n>` value is used as the output file name.
 
 ### 5.3 Stdin
-Raw M code. The query is named `query` by default; override with `--query-name <name>`.
+Raw M code (single `let … in` expression). The query is named `query` by default; override with `--query-name <n>`.
 
 ---
 
@@ -201,7 +263,7 @@ Each binding in the `let` block that produces a table value becomes a CTE. The `
 
 **Rules:**
 - Bindings that are scalar (not table-valued) are inlined as SQL expressions, not CTEs.
-- Bindings used only once may be inlined (optional optimisation, off by default; enable with `--inline-singles`).
+- Bindings used only once may be inlined (optional optimisation; enable with `--inline-singles`).
 - CTE names are the M binding names, sanitised to valid SQL identifiers (replace spaces and special chars with `_`).
 
 **Example M:**
@@ -242,18 +304,25 @@ Table.SelectRows(table, each <condition>)
 - `each` introduces a row context; `_[ColumnName]` and `[ColumnName]` both refer to the current row.
 - Supported condition operators: `=`, `<>`, `>`, `<`, `>=`, `<=`, `and`, `or`, `not`.
 - Supported functions within conditions: `Text.StartsWith`, `Text.EndsWith`, `Text.Contains`, `List.Contains`, `Date.From`, `DateTime.From`.
-- Translate `Text.StartsWith(x, v)` → `x LIKE 'v%'`, `Text.Contains(x, v)` → `x LIKE '%v%'`, etc.
-- `List.Contains({v1,v2}, x)` → `x IN (v1, v2)`.
+
+| M function | SQL translation |
+|---|---|
+| `Text.StartsWith(x, v)` | `x LIKE 'v%'` |
+| `Text.EndsWith(x, v)` | `x LIKE '%v'` |
+| `Text.Contains(x, v)` | `x LIKE '%v%'` |
+| `List.Contains({v1,v2}, x)` | `x IN (v1, v2)` |
+
+For dialects where `ILIKE` is supported (`postgres`, `snowflake`, `duckdb`), `Text.*` comparisons are case-sensitive LIKE by default. An optional third argument `Comparer.OrdinalIgnoreCase` maps to `ILIKE`; all other comparers emit a warning and fall back to `LIKE`.
 
 ### 6.4 `Table.SelectColumns` → `SELECT <cols>`
 
 ```m
 Table.SelectColumns(table, {"Col1", "Col2", ...})
--- or with rename:
-Table.SelectColumns(table, {{"NewName", each [OldName]}, ...})
 ```
 
-Translate to `SELECT Col1, Col2, … FROM <table>` or `SELECT OldName AS NewName, …`.
+Translates to `SELECT Col1, Col2, … FROM <table>`. Column order in the output follows the order of the list literal.
+
+> **Note on renaming:** `Table.SelectColumns` does **not** support inline column renaming in the M language. To rename columns, Power Query uses `Table.RenameColumns` as a separate step (see §6.9). The pattern `{{"NewName", each [OldName]}, ...}` does not exist in the M specification and must not be generated or accepted.
 
 ### 6.5 `Table.Join` / `Table.NestedJoin` → `JOIN`
 
@@ -273,7 +342,7 @@ Table.NestedJoin(left, leftKey, right, rightKey, newCol, joinKind)
 | `JoinKind.LeftAnti` | `LEFT JOIN … WHERE right.key IS NULL` |
 | `JoinKind.RightAnti` | `RIGHT JOIN … WHERE left.key IS NULL` |
 
-For `Table.NestedJoin`, the nested column is expanded into a `JOIN` (the nested table column is not materialised; the result columns must be subsequently expanded by a `Table.ExpandTableColumn` step, which is translated as additional `SELECT` projections).
+For `Table.NestedJoin`, the nested column (`newCol`) is not materialised as a table-valued column; the step must be followed by `Table.ExpandTableColumn` (see §6.10), which is translated as additional `SELECT` projections in the same CTE. A `Table.NestedJoin` without a subsequent `Table.ExpandTableColumn` emits a warning and selects only the left-side columns.
 
 Composite keys (list literals) → `ON a.k1 = b.k1 AND a.k2 = b.k2`.
 
@@ -288,14 +357,15 @@ Table.Group(table, {"GroupKey"}, {
 
 **Aggregate function mapping:**
 
-| M function | SQL |
-|---|---|
-| `List.Sum([col])` | `SUM(col)` |
-| `List.Average([col])` | `AVG(col)` |
-| `List.Count([col])` / `Table.RowCount(_)` | `COUNT(*)` or `COUNT(col)` |
-| `List.Min([col])` | `MIN(col)` |
-| `List.Max([col])` | `MAX(col)` |
-| `List.CountDistinct([col])` | `COUNT(DISTINCT col)` |
+| M function | SQL | Notes |
+|---|---|---|
+| `List.Sum([col])` | `SUM(col)` | |
+| `List.Average([col])` | `AVG(col)` | |
+| `List.Count([col])` | `COUNT(col)` | Counts non-null values in the column |
+| `Table.RowCount(_)` | `COUNT(*)` | Counts all rows regardless of nulls |
+| `List.Min([col])` | `MIN(col)` | |
+| `List.Max([col])` | `MAX(col)` | |
+| `List.CountDistinct([col])` | `COUNT(DISTINCT col)` | |
 
 ### 6.7 `Table.AddColumn` → computed column in `SELECT`
 
@@ -327,6 +397,71 @@ Translate as a new `SELECT` column: `<expr> AS NewCol`. The `type` hint is used 
 
 Unsupported types emit a warning and substitute the literal token `/* UNSUPPORTED_TYPE */`.
 
+### 6.9 `Table.RenameColumns` → column aliases in `SELECT`
+
+```m
+Table.RenameColumns(table, {{"OldName", "NewName"}, {"OldName2", "NewName2"}, ...})
+```
+
+Translates to a new CTE (or merges into the parent SELECT when `--inline-singles` is active) that projects each renamed column as `OldName AS NewName`. Columns not appearing in the rename list are passed through unchanged via `SELECT *` expansion or explicit listing depending on whether any non-renamed columns need to survive.
+
+**Implementation rule:** Because SQL `SELECT * EXCEPT (...)` is not universally supported, emit all column aliases explicitly when the rename list is partial. If the full set of columns is not statically known at translation time (e.g. the source is `/* SOURCE: … */`), emit `/* WARN: full column list unknown; rename translated as partial alias list */`.
+
+**Example M:**
+```m
+Table.RenameColumns(Orders, {{"CustomerNo", "CustomerID"}, {"Amt", "Amount"}})
+```
+
+**Expected SQL:**
+```sql
+SELECT CustomerNo AS CustomerID, Amt AS Amount, <other cols>
+FROM Orders
+```
+
+### 6.10 `Table.ExpandTableColumn` → JOIN column projections
+
+```m
+Table.ExpandTableColumn(table, "NestedCol", {"Col1", "Col2", ...}, {"Alias1", "Alias2", ...})
+```
+
+Supported only when immediately following a `Table.NestedJoin` step (the column list form). Translates by absorbing the expansion into the JOIN CTE generated by the `NestedJoin`, adding the specified columns from the right-hand table to the `SELECT` list.
+
+**Rules:**
+- The `"NestedCol"` argument must match the `newCol` parameter of the preceding `Table.NestedJoin`; a mismatch emits an error.
+- The optional fourth argument (alias list) maps to `right.ColN AS AliasN` in the SELECT. When absent, columns are projected without aliases.
+- Only the column-list form is supported in v1. An `ExpandTableColumn` that targets a non-join nested column (e.g. from `Table.AddColumn`) emits `/* UNTRANSLATABLE: ExpandTableColumn on non-join source */`.
+
+**Example M:**
+```m
+let
+    Source    = Sql.Database("srv", "db"),
+    Orders    = Source{[Name="Orders"]}[Data],
+    Customers = Source{[Name="Customers"]}[Data],
+    Joined    = Table.NestedJoin(Orders, "CustomerID", Customers, "ID", "CustData", JoinKind.Left),
+    Expanded  = Table.ExpandTableColumn(Joined, "CustData", {"Name", "Email"}, {"CustName", "CustEmail"})
+in
+    Expanded
+```
+
+**Expected SQL:**
+```sql
+WITH Orders AS (
+    SELECT * FROM db.Orders
+),
+Customers AS (
+    SELECT * FROM db.Customers
+),
+Expanded AS (
+    SELECT
+        Orders.*,
+        Customers.Name  AS CustName,
+        Customers.Email AS CustEmail
+    FROM Orders
+    LEFT JOIN Customers ON Orders.CustomerID = Customers.ID
+)
+SELECT * FROM Expanded;
+```
+
 ---
 
 ## 7. Error Handling
@@ -335,8 +470,8 @@ Controlled by `--on-error`:
 
 | Mode | Behaviour |
 |---|---|
-| `fail` | Halt immediately on first untranslatable expression. Exit code 1. Print the M expression, file name, and line number to stderr. |
-| `comment` | Replace the untranslatable expression with a SQL comment: `/* UNTRANSLATABLE: <original M> */`. Continue processing. Exit code 0. |
+| `fail` | Process **all** input files completely, collecting every translation error encountered. After all files are processed, print each error to stderr (or as JSON entries if `--log-json`) and **exit with code 1**. No `.sql` file is written for any file that contained at least one translation error; successfully translated files are written normally. |
+| `comment` | Replace each untranslatable expression with a SQL comment: `/* UNTRANSLATABLE: <original M> */`. Continue processing. Exit code 0. |
 | `warn` (default) | Same as `comment`, but additionally print a structured warning to stderr: `WARN [file:line] Untranslatable: <description>`. Exit code 0. |
 
 ### Warning format (stderr)
@@ -359,25 +494,38 @@ ERROR [Sales.pq:14] Cannot translate: Table.Pivot
 
 | Source | Output file name |
 |---|---|
-| `Sales.pq` | `Sales.sql` |
-| `Orders.m` | `Orders.sql` |
+| `Sales.pq` (single `let…in`) | `Sales.sql` |
+| `Orders.m` (single `let…in`) | `Orders.sql` |
+| `Queries.pq` (section syntax, binding `Orders`) | `Orders.sql` |
+| `Queries.pq` (section syntax, binding `Customers`) | `Customers.sql` |
 | `model/tables/Sales.tmdl` (table `Sales`) | `Sales.sql` |
 | stdin, `--query-name Foo` | `Foo.sql` |
-| stdin, no name | `query.sql` |
+| stdin, no `--query-name` | `query.sql` |
 
-If two queries resolve to the same output name, append `_2`, `_3`, etc.
+If two queries resolve to the same output name, append `_2`, `_3`, etc. in the order they are encountered.
 
 ---
 
 ## 9. Dialect-Specific Emission Rules
 
-Implemented in `src/dialect/<name>.rs`, each implementing the `Dialect` trait:
+Implemented in `src/dialect/<n>.rs`, each implementing the `Dialect` trait:
 
 ```rust
 pub trait Dialect: Send + Sync {
     fn name(&self) -> &'static str;
-    fn identifier_quote(&self) -> char;          // " for most, ` for bigquery
-    fn string_quote(&self) -> char;              // ' for all
+
+    /// The opening quote character for identifiers.
+    /// e.g. `"` for most dialects, `` ` `` for BigQuery, `[` for T-SQL.
+    fn identifier_quote(&self) -> char;
+
+    /// The closing quote character for identifiers.
+    /// Defaults to `identifier_quote()`, which is correct for symmetric quoting styles.
+    /// T-SQL overrides this to return `]`.
+    fn identifier_close_quote(&self) -> char {
+        self.identifier_quote()
+    }
+
+    fn string_quote(&self) -> char;              // ' for all dialects
     fn cast_syntax(&self, expr: &str, ty: &str) -> String; // CAST(x AS t) vs x::t
     fn supports_cte(&self) -> bool;              // all true in v1
     fn ilike_supported(&self) -> bool;           // postgres, snowflake, duckdb = true
@@ -390,7 +538,7 @@ pub trait Dialect: Send + Sync {
 
 **Dialect-specific notes:**
 
-- **T-SQL**: Use `[identifier]` quoting. `CAST` not `::`. `TOP n` instead of `LIMIT`. `BIT` for booleans. `GETDATE()` for current timestamp.
+- **T-SQL**: Use `[identifier]` quoting (`identifier_quote() = '['`, `identifier_close_quote() = ']'`). `CAST(x AS t)` syntax only (no `::` shorthand). `TOP n` instead of `LIMIT`. `BIT` for booleans. `GETDATE()` for current timestamp.
 - **PostgreSQL**: Use `"identifier"` quoting. Support `::` cast shorthand. `ILIKE` for case-insensitive `LIKE`. `NOW()` for current timestamp.
 - **BigQuery**: Use `` `identifier` `` quoting. `CAST(x AS type)` only. Table references as `` `project.dataset.table` `` if fully qualified. `CURRENT_TIMESTAMP()`.
 - **Snowflake**: Use `"identifier"` quoting. `ILIKE` supported. `CURRENT_TIMESTAMP()`.
@@ -492,25 +640,27 @@ Run: `cargo test` and `cargo insta review` for snapshot approval.
 
 ### 11.3 Required test fixtures (minimum)
 
-| Fixture | M construct exercised |
+| Fixture | M construct(s) exercised |
 |---|---|
-| `select_rows_simple.pq` | Single `Table.SelectRows` with comparison |
-| `select_rows_text.pq` | `Text.StartsWith`, `Text.Contains` |
+| `select_rows_simple.pq` | `Table.SelectRows` with comparison operators |
+| `select_rows_text.pq` | `Text.StartsWith`, `Text.EndsWith`, `Text.Contains` |
 | `select_rows_list.pq` | `List.Contains` |
-| `select_cols.pq` | `Table.SelectColumns` with rename |
+| `select_cols.pq` | `Table.SelectColumns` — column selection only |
+| `rename_cols.pq` | `Table.RenameColumns` — full and partial rename lists |
 | `join_inner.pq` | `Table.Join` — inner |
 | `join_left.pq` | `Table.Join` — left |
 | `join_anti.pq` | `Table.Join` — left anti |
 | `join_composite.pq` | `Table.Join` — composite key |
 | `nested_join.pq` | `Table.NestedJoin` + `Table.ExpandTableColumn` |
-| `group_basic.pq` | `Table.Group` — SUM, COUNT |
-| `group_multi.pq` | `Table.Group` — multiple aggregates |
-| `add_column.pq` | `Table.AddColumn` with arithmetic expr |
-| `cast_types.pq` | `Table.TransformColumnTypes` — multiple types |
+| `group_basic.pq` | `Table.Group` — `List.Sum`, `Table.RowCount` |
+| `group_multi.pq` | `Table.Group` — multiple aggregates, `List.CountDistinct` |
+| `add_column.pq` | `Table.AddColumn` with arithmetic expression |
+| `cast_types.pq` | `Table.TransformColumnTypes` — all supported M types per dialect |
 | `multi_step.pq` | Full `let … in` pipeline → CTE chain |
+| `section_syntax.pq` | M section syntax — multiple `shared` bindings → separate `.sql` files |
 | `tmdl_table.tmdl` | TMDL file with embedded M partition |
-| `untranslatable.pq` | Unknown function → `--on-error` modes |
-| `stdin_query` | (tested via CLI process spawn) |
+| `untranslatable.pq` | Unknown function → all three `--on-error` modes |
+| `stdin_query` | (tested via CLI process spawn with `--query-name`) |
 
 ### 11.4 Determinism test
 Run the same input 100 times and assert byte-for-byte identical output. Include in CI.
@@ -527,12 +677,12 @@ thiserror     = "1"
 indexmap      = "2"          # Preserve insertion order for CTEs
 regex         = "1"
 once_cell     = "1"
-insta         = { version = "1", features = ["yaml"] }  # snapshot testing
 
 [dev-dependencies]
-insta         = { version = "1", features = ["yaml"] }
+insta         = { version = "1", features = ["yaml"] }  # snapshot testing (test-only)
 assert_cmd    = "2"          # CLI integration tests
 predicates    = "3"
+criterion     = { version = "0.5", features = ["html_reports"] }  # benchmarks (NFR §1.4)
 ```
 
 No network-capable crates. No async runtime required (all I/O is synchronous file operations).
@@ -551,7 +701,7 @@ No network-capable crates. No async runtime required (all I/O is synchronous fil
 
 ## 14. Implementation Order (suggested)
 
-1. `src/parser/` — lexer + grammar + AST (cover all v1 M constructs).
+1. `src/parser/` — lexer + grammar + AST (cover all v1 M constructs, including section syntax).
 2. `src/resolver/source.rs` — data source inference.
 3. `src/dialect/` — `Dialect` trait + all five implementations.
 4. `src/translator/expr.rs` — M expression → SQL expression (no table ops yet).
@@ -560,19 +710,25 @@ No network-capable crates. No async runtime required (all I/O is synchronous fil
 7. `src/translator/cast.rs` — type mapping table.
 8. `src/emitter/sql_writer.rs` — SQL AST pretty-printer.
 9. `src/pipeline.rs` — wire all stages together.
-10. `src/cli.rs` + `src/main.rs` — argument parsing, file I/O, stdin handling.
+10. `src/cli.rs` + `src/main.rs` — argument parsing, file I/O, stdin handling (including all flags from §3.4).
 11. Integration tests + snapshot baselines.
-12. TMDL parser (builds on top of the M parser; extracts `source = ``` … ```  ` blocks).
+12. TMDL parser (builds on top of the M parser; extracts `source = ``` … ``` ` blocks).
 
 ---
 
 ## 15. Acceptance Criteria
 
-- [ ] All 18 test fixtures translate without errors for all 5 dialects.
+- [ ] All 19 test fixtures translate without errors for all 5 dialects.
 - [ ] All snapshot tests pass (`cargo insta test`).
-- [ ] `--on-error fail` exits with code 1 on `untranslatable.pq`.
+- [ ] `--on-error fail` processes all files, then exits with code 1; no partial `.sql` written for errored files.
 - [ ] `--on-error comment` exits with code 0 and embeds `/* UNTRANSLATABLE: … */`.
 - [ ] `--on-error warn` exits with code 0 and prints `WARN` lines to stderr.
+- [ ] `--log-json` emits all diagnostics as newline-delimited JSON to stderr.
+- [ ] `--query-name` correctly names stdin queries in both file output and `--stdout` separator banners.
+- [ ] `--inline-singles` inlines single-reference CTEs and snapshot output differs from default.
+- [ ] Section-syntax `.pq` files produce one `.sql` per `shared` binding.
+- [ ] `Table.RenameColumns` produces correct column aliases for all 5 dialects.
+- [ ] `Table.ExpandTableColumn` is correctly absorbed into the preceding `NestedJoin` CTE.
 - [ ] Determinism test passes (100 runs, byte-identical output).
 - [ ] `cargo clippy -- -D warnings` produces zero warnings.
 - [ ] `cargo test` passes on Linux, macOS, and Windows.

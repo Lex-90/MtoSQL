@@ -1,9 +1,15 @@
 # NFR: `m2sql` — Non-Functional Requirements
 
-**Version:** 1.0.0  
-**Status:** Ready for implementation  
-**Companion doc:** `PRD_m2sql.md`  
+**Version:** 1.1.0
+**Status:** Ready for implementation
+**Companion doc:** `PRD_m2sql.md`
 **Runtime:** Rust (stable toolchain, MSRV 1.75)
+
+> **Changelog from v1.0.0**
+> - §2.3: Corrected `--on-error fail` error-isolation semantics to match PRD §7 (report-and-exit after all files, not halt-on-first-error).
+> - §7.1: Corrected `rustflags` explanation; clarified actual sources of build reproducibility; added `rust-toolchain.toml` requirement.
+> - §8.2: Fixed incorrect TTY check reference (`stdout` → `stderr`).
+> - Appendix A: Added traceability entries for `--log-json`, `--query-name`, `--inline-singles`, `Table.RenameColumns`, `Table.ExpandTableColumn`.
 
 ---
 
@@ -68,7 +74,9 @@ Fidelity is validated through the snapshot test suite. Any change that modifies 
 
 ### 2.3 Error isolation
 
-A translation failure in one file must not prevent other files from being translated (unless `--on-error fail` is set). Errors are collected and reported together at the end of the run.
+A translation failure in one file must not prevent other files from being translated. Errors are collected across all files and reported together at the end of the run.
+
+When `--on-error fail` is set: all input files are still processed in full, all translation errors are collected, and the process exits with code 1 after reporting every error. No `.sql` file is written for any file that contained at least one translation error; files that translated successfully are written normally. There is no "halt on first error" mode.
 
 ### 2.4 No silent data loss
 
@@ -181,66 +189,36 @@ Example format (plain text):
 ```
 ERROR [Orders.pq:42] Cannot translate: Table.Pivot
   Source: Table.Pivot(Unpivoted, List.Distinct(Unpivoted[Attribute]), "Attribute", "Value")
+  Dialect: tsql
   Reason: Table.Pivot is not in the v1 feature set.
-  Hint:   Use --on-error comment to emit a placeholder and continue.
 ```
 
 ### 5.2 JSON log format (`--log-json`)
 
-When `--log-json` is passed, all diagnostic output goes to stderr as newline-delimited JSON (NDJSON). Plain-text output is suppressed. Each line is one JSON object:
+When `--log-json` is set, every diagnostic line to stderr is a newline-delimited JSON object. Field schema:
 
 ```json
-{"level":"warn","file":"Orders.pq","line":42,"code":"UNTRANSLATABLE","message":"Table.Pivot is not in the v1 feature set.","fragment":"Table.Pivot(Unpivoted, ...)"}
-{"level":"security","file":"Sales.pq","line":7,"code":"CREDENTIAL_REDACTED","message":"Credential key 'Password' redacted.","fragment":null}
-{"level":"info","file":"Sales.pq","line":null,"code":"TRANSLATED","message":"Wrote Sales.sql","fragment":null}
+{"level":"warn","file":"Sales.pq","line":14,"code":"UNTRANSLATABLE","message":"Table.Pivot is not in the v1 feature set.","fragment":"Table.Pivot(Unpivoted, ...)"}
+{"level":"error","file":"Sales.pq","line":22,"code":"UNSUPPORTED_TYPE","message":"type duration is not supported in tsql","fragment":"type duration"}
+{"level":"security","file":"Creds.pq","line":3,"code":"CREDENTIAL_REDACTED","message":"key 'password' redacted","fragment":null}
+{"level":"info","file":null,"line":null,"code":"SUMMARY","message":"12 translated, 0 errors, 2 warnings","duration_ms":1203}
 ```
 
-Fields:
+Field stability: all field names are stable within a major version (SemVer). New optional fields may be added in minor releases; consumers must ignore unknown fields.
 
-| Field | Type | Always present | Description |
-|---|---|---|---|
-| `level` | string | yes | `"error"`, `"warn"`, `"security"`, `"info"` |
-| `file` | string | yes | Source file path or `"<stdin>"` |
-| `line` | int \| null | no | 1-indexed line number, null if not applicable |
-| `code` | string | yes | Machine-readable code (see below) |
-| `message` | string | yes | Human-readable description |
-| `fragment` | string \| null | no | The M source fragment, redacted if credentials involved |
+### 5.3 `--help` quality
 
-**Log codes:**
-
-| Code | Meaning |
-|---|---|
-| `TRANSLATED` | File translated successfully |
-| `UNTRANSLATABLE` | Expression could not be translated |
-| `CREDENTIAL_REDACTED` | A credential value was redacted |
-| `PATH_TRAVERSAL` | Output path rejected for security |
-| `FILE_TOO_LARGE` | Input file exceeded 10 MB limit |
-| `PARSE_ERROR` | M source could not be parsed |
-| `IO_ERROR` | File read/write failure |
-
-### 5.3 `--help` output
-
-`--help` must display for every flag: the flag name, short alias, value type, default value, and a one-sentence description. Generated automatically by `clap`.
-
-### 5.4 `--version` output
-
-Must print `m2sql <semver>` on a single line. No extra lines, no ANSI codes.
-
-```
-m2sql 1.0.0
-```
-
-### 5.5 No unnecessary output
-
-When all files translate without warnings, the tool produces no stderr output (unless `--log-json` is set, in which case only `TRANSLATED` info entries appear). Stdout is empty unless `--stdout` is set. This ensures the tool is safe to use in shell pipelines and CI scripts that treat any stderr as a failure signal.
+- Every flag must be listed with its type, default value, and a one-sentence description.
+- Enum values must be enumerated inline (e.g. `[tsql|postgres|bigquery|snowflake|duckdb]`).
+- The help text must fit in an 80-column terminal without wrapping mid-sentence.
 
 ---
 
-## 6. Compatibility & Portability
+## 6. Compatibility
 
-### 6.1 Supported platforms (release binary)
+### 6.1 Platform targets
 
-| Platform | Architecture | Libc | Tier |
+| OS | Architecture | Toolchain | Tier |
 |---|---|---|---|
 | Linux | x86-64 | glibc ≥ 2.17 | Tier 1 — must pass all tests |
 | Windows | x86-64 | MSVC | Tier 1 — must pass all tests |
@@ -271,22 +249,37 @@ No timestamp values are generated in output content. The tool does not read the 
 
 ### 7.1 Build reproducibility
 
-The release binary must be reproducible: building from the same `Cargo.lock` and the same Rust toolchain version on the same OS must produce a byte-for-byte identical binary. Enable via:
+The release binary must be reproducible: building from the same `Cargo.lock` and the same Rust toolchain version on the same OS must produce a byte-for-byte identical binary.
 
+**Required mechanisms:**
+
+A `rust-toolchain.toml` file must be committed to the repository, pinning the exact toolchain channel and version:
+```toml
+[toolchain]
+channel = "1.75.0"
+```
+
+The following profile settings contribute to reproducibility by eliminating non-deterministic metadata and path embeddings:
 ```toml
 # .cargo/config.toml
 [build]
 rustflags = ["-C", "metadata=m2sql"]
+# Sets a fixed crate metadata hash suffix, preventing non-deterministic
+# symbol mangling across invocations with differing metadata seeds.
+# This alone does not guarantee full reproducibility — the rust-toolchain.toml
+# pin and the settings below are equally required.
 ```
 
-And strip debug symbols in release builds:
 ```toml
 [profile.release]
-strip = true
+strip = true          # Removes debug info, which is the primary source of
+                      # build-machine path embeddings in binaries.
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+codegen-units = 1     # Eliminates non-determinism from parallel codegen scheduling.
 ```
+
+> **Note:** `strip = true` removes DWARF debug sections, which eliminates the need for `--remap-path-prefix` path scrubbing in this project. If debug builds are ever distributed, `--remap-path-prefix` must be added to `rustflags`.
 
 ### 7.2 Dependency constraints
 
@@ -351,7 +344,7 @@ JSON:
 {"level":"info","file":null,"line":null,"code":"SUMMARY","message":"12 translated, 0 errors, 2 warnings","duration_ms":1203}
 ```
 
-The summary is suppressed if `--no-color` is set and stdout is not a TTY, allowing clean pipe usage.
+The summary is suppressed if `--no-color` is set and **stderr** is not a TTY, allowing clean pipe usage. (Note: the summary is written to stderr, so the TTY check is correctly performed on stderr, not stdout.)
 
 ### 8.3 Timing
 
@@ -408,7 +401,7 @@ CI runs on: `ubuntu-latest`, `windows-latest`, `macos-13` (Intel runner).
 | NFR-PERF-02 | Memory | §3 (CLI) | Manual profiling (v1); Valgrind post-v1 |
 | NFR-REL-01 | Determinism | §2 (Goals) | Determinism CI gate (100 runs) |
 | NFR-REL-02 | Translation fidelity | §6 (M features) | Snapshot tests |
-| NFR-REL-03 | Error isolation | §7 (Error handling) | Integration tests |
+| NFR-REL-03 | Error isolation | §7 (Error handling) | Integration tests (all files processed before exit) |
 | NFR-SEC-01 | Credential redaction | §5.1 (Resolver) | Unit tests + security-tagged snapshots |
 | NFR-SEC-02 | No code execution | §2 (Goals) | Code review + clippy |
 | NFR-SEC-03 | Path traversal | §3.2 (Output) | Integration test with `../../` query name |
@@ -417,10 +410,15 @@ CI runs on: `ubuntu-latest`, `windows-latest`, `macos-13` (Intel runner).
 | NFR-MAINT-01 | Style | §4 (Project) | `cargo fmt` + `clippy` CI gates |
 | NFR-MAINT-02 | Coverage | §11 (Testing) | `cargo llvm-cov` CI gate |
 | NFR-USE-01 | Error messages | §7 (Errors) | Integration test output assertions |
-| NFR-USE-02 | JSON log format | §3.4 (CLI) | Integration tests with `--log-json` |
+| NFR-USE-02 | JSON log format | §3.4 (CLI) / §5.2 (NFR) | Integration tests with `--log-json` |
+| NFR-USE-03 | `--query-name` flag | §5.3 (Input) / §8 (Output) | Integration tests: stdin + `--stdout` separator |
+| NFR-USE-04 | `--inline-singles` flag | §6.2 (CTE chain) | Snapshot diff vs default output |
 | NFR-COMPAT-01 | Platform targets | §3 (CLI) | CI matrix (ubuntu, windows, macos-13) |
 | NFR-COMPAT-02 | Locale independence | §2 (Goals) | CI runs with `LC_ALL=C` and `LC_ALL=tr_TR` |
 | NFR-DIST-01 | GitHub Releases | §3 (Distribution) | Release workflow |
 | NFR-DIST-02 | Homebrew formula | §3 (Distribution) | Formula `test` block in CI |
 | NFR-DIST-03 | Binary size | §2 (Goals) | Binary size CI gate |
+| NFR-DIST-04 | Build reproducibility | §7.1 | `rust-toolchain.toml` pin + CI artefact hash check |
 | NFR-VER-01 | SemVer | §2 (Goals) | Changelog review on PR |
+| NFR-FEAT-01 | `Table.RenameColumns` | §6.9 (PRD) | Snapshot tests (`rename_cols.pq`) |
+| NFR-FEAT-02 | `Table.ExpandTableColumn` | §6.10 (PRD) | Snapshot tests (`nested_join.pq`) |
