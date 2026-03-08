@@ -1,0 +1,426 @@
+# NFR: `m2sql` — Non-Functional Requirements
+
+**Version:** 1.0.0  
+**Status:** Ready for implementation  
+**Companion doc:** `PRD_m2sql.md`  
+**Runtime:** Rust (stable toolchain, MSRV 1.75)
+
+---
+
+## 1. Performance
+
+### 1.1 Throughput targets
+
+Measured on the reference hardware profile: a 4-core x86-64 machine with 8 GB RAM and an SSD, running a small workload (≤50 files, ≤500 lines each).
+
+| Scenario | Target |
+|---|---|
+| Single file, ≤500 lines | ≤ 50 ms wall time (cold binary, warm FS) |
+| 50 files, each ≤500 lines | ≤ 1 s wall time |
+| Startup overhead (empty run, `--version`) | ≤ 10 ms |
+
+These are upper bounds. The tool must not regress past them in CI benchmarks.
+
+### 1.2 Memory
+
+| Scenario | Target |
+|---|---|
+| Single file, ≤500 lines | ≤ 32 MB RSS |
+| 50 files | ≤ 128 MB RSS |
+
+Files are parsed and translated sequentially; no full corpus is held in memory simultaneously. Each file's AST is dropped before the next file is read.
+
+### 1.3 Parallelism
+
+v1 processes files sequentially. Parallel processing (via Rayon) is a post-v1 optimisation. Sequential processing is sufficient for the small-scale target workload and keeps the error output deterministically ordered.
+
+### 1.4 Benchmark harness
+
+A `benches/` directory must contain at least one Criterion benchmark covering:
+- Parse only (50 × 500-line fixture).
+- Parse + translate + emit (50 × 500-line fixture).
+
+Run with `cargo bench`. Benchmark results are committed as `benches/baseline.txt` and compared in CI to detect regressions ≥ 20%.
+
+---
+
+## 2. Reliability & Correctness
+
+### 2.1 Determinism (hard requirement)
+
+Given the same input bytes, environment variables, and CLI flags, the tool must produce byte-for-byte identical output across:
+- Multiple runs on the same machine.
+- Runs on different machines with the same OS and architecture.
+- Runs on different supported OSes (Linux, macOS, Windows).
+
+Implementation rules to guarantee this:
+- No use of `HashMap` where insertion order affects output — use `IndexMap` (already listed in `Cargo.toml`).
+- No use of `std::time`, `SystemTime`, or any timestamp in output content.
+- No randomly generated identifiers.
+- CTE names derived solely from M binding names, sanitised deterministically (Unicode NFKC normalisation → replace non-`[a-zA-Z0-9_]` chars with `_` → deduplicate with `_2`, `_3` suffix in order of first appearance).
+- File processing order follows the order arguments are supplied on the CLI; glob expansion is sorted lexicographically before processing.
+
+### 2.2 Translation fidelity
+
+The SQL output must be semantically equivalent to the M expression for all constructs in the v1 feature surface (§6 of PRD). "Semantically equivalent" means: executing the SQL against the same data source that the M query targets must return the same rows and columns (modulo row ordering, which M does not guarantee either).
+
+Fidelity is validated through the snapshot test suite. Any change that modifies a snapshot requires explicit human approval via `cargo insta review`.
+
+### 2.3 Error isolation
+
+A translation failure in one file must not prevent other files from being translated (unless `--on-error fail` is set). Errors are collected and reported together at the end of the run.
+
+### 2.4 No silent data loss
+
+If a CTE step or column cannot be translated, it must either:
+- Cause a visible error/warning, or
+- Produce a `/* UNTRANSLATABLE: … */` placeholder comment.
+
+Silently dropping steps or columns is never acceptable.
+
+---
+
+## 3. Security
+
+### 3.1 Credential redaction
+
+M source files may contain inline credentials (e.g. passwords in connection strings). The tool must detect and redact the following patterns before they appear in any output (SQL files, stdout, stderr, JSON logs):
+
+| Pattern | Detection heuristic | Replacement in output |
+|---|---|---|
+| `Password="..."` / `password="..."` | Case-insensitive key `password` in a record literal | `Password=/* REDACTED */` |
+| `AccountKey="..."` | Key name `accountkey` (Azure Blob) | `AccountKey=/* REDACTED */` |
+| `AccessKey="..."` / `SecretKey="..."` | Key names `accesskey`, `secretkey` | `[Key]=/* REDACTED */` |
+| `Credentials=[...]` record fields | Key name `credentials` | `Credentials=/* REDACTED */` |
+| Connection string `pwd=...;` / `password=...;` inside a text literal | Regex on string content | value replaced with `***` |
+
+**Server names and database names are never redacted** — they are infrastructure-level references that belong in SQL output.
+
+When a redaction occurs the tool must:
+1. Insert `/* SECURITY: credential redacted by m2sql */` on the line immediately above the affected SQL fragment.
+2. Emit a `WARN` (or JSON log entry with `"level": "security"`) to stderr identifying the file, line number, and key name — but never the credential value.
+
+Redaction runs before any other output stage. It is not configurable; it cannot be disabled.
+
+### 3.2 No code execution
+
+The tool must never evaluate M expressions — it operates purely as a text transformer. No use of `eval`, shell expansion, or subprocess spawning on user-supplied content.
+
+### 3.3 Path traversal
+
+When writing output files, the tool must resolve all output paths relative to `--output-dir` and reject any path that would write outside that directory (e.g. via `../../` in a query name inferred from a TMDL table name). Emit an error and skip the file if such a path is detected.
+
+### 3.4 Input size guard
+
+Reject any single input file larger than 10 MB with a clear error message. This prevents accidental processing of binary files (e.g. a misidentified `.pbix` passed as `.pq`).
+
+### 3.5 Supply chain
+
+- No network-capable crates (enforced — see §7.2).
+- Dependency audit must pass `cargo deny check` in CI (licences, advisories, bans).
+- `Cargo.lock` is committed and pinned. Dependency updates require deliberate PRs.
+
+---
+
+## 4. Maintainability
+
+### 4.1 Code style
+
+- `cargo fmt` (default settings) must produce no diff.
+- `cargo clippy -- -D warnings` must produce zero warnings on all three target platforms.
+- All public items in `src/` must have doc comments (`///`).
+
+### 4.2 Module boundaries
+
+Each stage of the pipeline (parse, resolve, translate, emit) must compile independently. Cross-stage dependencies must flow strictly in one direction: `parser → resolver → translator → emitter`. No reverse imports.
+
+### 4.3 Adding a new dialect
+
+Adding a new SQL dialect must require changes only to:
+- A new file in `src/dialect/`.
+- A new arm in the `--dialect` enum in `src/cli.rs`.
+- New snapshot files in `tests/snapshots/<dialect>/`.
+
+No changes to the parser, resolver, or translator core logic.
+
+### 4.4 Adding a new M function
+
+Adding support for a new M function must require changes only to:
+- `src/translator/functions.rs` (one new match arm or handler function).
+- A new test fixture + snapshots.
+
+### 4.5 Test coverage
+
+| Scope | Minimum line coverage |
+|---|---|
+| `src/parser/` | 90% |
+| `src/translator/` | 85% |
+| `src/dialect/` | 80% |
+| `src/resolver/` | 85% |
+| Overall | 80% |
+
+Coverage is measured with `cargo llvm-cov` and enforced in CI. PRs that drop coverage below these thresholds must not be merged.
+
+### 4.6 Changelog
+
+A `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com) format must be maintained. Every PR must include a changelog entry.
+
+---
+
+## 5. Usability
+
+### 5.1 Error messages
+
+All error and warning messages must include:
+- The source file name (or `<stdin>`).
+- The 1-indexed line number within that file.
+- A plain-English description of what failed and why.
+- The original M fragment that could not be translated (truncated to 120 chars if longer).
+
+Example format (plain text):
+```
+ERROR [Orders.pq:42] Cannot translate: Table.Pivot
+  Source: Table.Pivot(Unpivoted, List.Distinct(Unpivoted[Attribute]), "Attribute", "Value")
+  Reason: Table.Pivot is not in the v1 feature set.
+  Hint:   Use --on-error comment to emit a placeholder and continue.
+```
+
+### 5.2 JSON log format (`--log-json`)
+
+When `--log-json` is passed, all diagnostic output goes to stderr as newline-delimited JSON (NDJSON). Plain-text output is suppressed. Each line is one JSON object:
+
+```json
+{"level":"warn","file":"Orders.pq","line":42,"code":"UNTRANSLATABLE","message":"Table.Pivot is not in the v1 feature set.","fragment":"Table.Pivot(Unpivoted, ...)"}
+{"level":"security","file":"Sales.pq","line":7,"code":"CREDENTIAL_REDACTED","message":"Credential key 'Password' redacted.","fragment":null}
+{"level":"info","file":"Sales.pq","line":null,"code":"TRANSLATED","message":"Wrote Sales.sql","fragment":null}
+```
+
+Fields:
+
+| Field | Type | Always present | Description |
+|---|---|---|---|
+| `level` | string | yes | `"error"`, `"warn"`, `"security"`, `"info"` |
+| `file` | string | yes | Source file path or `"<stdin>"` |
+| `line` | int \| null | no | 1-indexed line number, null if not applicable |
+| `code` | string | yes | Machine-readable code (see below) |
+| `message` | string | yes | Human-readable description |
+| `fragment` | string \| null | no | The M source fragment, redacted if credentials involved |
+
+**Log codes:**
+
+| Code | Meaning |
+|---|---|
+| `TRANSLATED` | File translated successfully |
+| `UNTRANSLATABLE` | Expression could not be translated |
+| `CREDENTIAL_REDACTED` | A credential value was redacted |
+| `PATH_TRAVERSAL` | Output path rejected for security |
+| `FILE_TOO_LARGE` | Input file exceeded 10 MB limit |
+| `PARSE_ERROR` | M source could not be parsed |
+| `IO_ERROR` | File read/write failure |
+
+### 5.3 `--help` output
+
+`--help` must display for every flag: the flag name, short alias, value type, default value, and a one-sentence description. Generated automatically by `clap`.
+
+### 5.4 `--version` output
+
+Must print `m2sql <semver>` on a single line. No extra lines, no ANSI codes.
+
+```
+m2sql 1.0.0
+```
+
+### 5.5 No unnecessary output
+
+When all files translate without warnings, the tool produces no stderr output (unless `--log-json` is set, in which case only `TRANSLATED` info entries appear). Stdout is empty unless `--stdout` is set. This ensures the tool is safe to use in shell pipelines and CI scripts that treat any stderr as a failure signal.
+
+---
+
+## 6. Compatibility & Portability
+
+### 6.1 Supported platforms (release binary)
+
+| Platform | Architecture | Libc | Tier |
+|---|---|---|---|
+| Linux | x86-64 | glibc ≥ 2.17 | Tier 1 — must pass all tests |
+| Windows | x86-64 | MSVC | Tier 1 — must pass all tests |
+| macOS | x86-64 (Intel) | system | Tier 1 — must pass all tests |
+
+Tier 1 means: CI runs the full test suite on this target on every PR. Release binaries are provided.
+
+macOS Apple Silicon (arm64) and Linux musl are Tier 2 (best-effort, not gated in CI for v1).
+
+### 6.2 Filesystem
+
+- Output directory is created with `std::fs::create_dir_all` if absent.
+- File names are sanitised for all three supported OSes: replace characters illegal on Windows (`\ / : * ? " < > |`) and POSIX (`/`) with `_`.
+- Line endings in SQL output: LF (`\n`) on Linux/macOS; CRLF (`\r\n`) on Windows. Controlled by `std::io::Write` on the target platform's default.
+- All file paths are handled as UTF-8. Non-UTF-8 paths emit `IO_ERROR` and are skipped.
+
+### 6.3 Locale independence
+
+The tool must produce identical output regardless of the system locale (`LC_ALL`, `LANG`). Number and string literals from M are always rendered in the invariant locale. No use of locale-sensitive formatting functions.
+
+### 6.4 Timezone independence
+
+No timestamp values are generated in output content. The tool does not read the system clock for any output purpose.
+
+---
+
+## 7. Build & Distribution
+
+### 7.1 Build reproducibility
+
+The release binary must be reproducible: building from the same `Cargo.lock` and the same Rust toolchain version on the same OS must produce a byte-for-byte identical binary. Enable via:
+
+```toml
+# .cargo/config.toml
+[build]
+rustflags = ["-C", "metadata=m2sql"]
+```
+
+And strip debug symbols in release builds:
+```toml
+[profile.release]
+strip = true
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+```
+
+### 7.2 Dependency constraints
+
+- No crate may make network calls at runtime (enforced via `cargo deny`).
+- No crate may execute subprocesses on user-supplied input.
+- Banned crates: `openssl`, `reqwest`, `hyper`, `tokio`, `async-std` (async runtime not needed).
+- All dependency licences must be MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, or ISC.
+
+`deny.toml` must enumerate all of the above. `cargo deny check` is a required CI gate.
+
+### 7.3 GitHub Releases
+
+On every semver tag (`v*.*.*`), a GitHub Actions workflow builds and uploads the following artefacts:
+
+| Artefact | Target triple |
+|---|---|
+| `m2sql-linux-x86_64.tar.gz` | `x86_64-unknown-linux-gnu` |
+| `m2sql-windows-x86_64.zip` | `x86_64-pc-windows-msvc` |
+| `m2sql-macos-x86_64.tar.gz` | `x86_64-apple-darwin` |
+
+Each archive contains: the binary, `README.md`, `LICENSE` (placeholder if licence not yet decided), and `CHANGELOG.md`.
+
+A `SHA256SUMS` file listing the hash of each archive is published alongside the artefacts.
+
+### 7.4 Homebrew formula
+
+A `homebrew-m2sql` tap repository must be maintained. The formula must:
+- Download the `macos-x86_64` archive from the GitHub Release.
+- Verify the SHA-256 checksum before installing.
+- Install the binary to `$(brew --prefix)/bin/m2sql`.
+- Include a `test` block: `system "#{bin}/m2sql", "--version"`.
+
+Formula update is automated: the GitHub Release workflow opens a PR against the tap repository with the new version and checksum.
+
+### 7.5 Binary size
+
+Release binary (stripped) must be ≤ 10 MB on all three Tier 1 targets. Enforced as a CI check using `ls -la` on the built binary after `cargo build --release`.
+
+---
+
+## 8. Observability & Diagnostics
+
+### 8.1 Exit codes (restatement from PRD for completeness)
+
+| Code | Meaning |
+|---|---|
+| 0 | Success (warnings may have been emitted) |
+| 1 | Translation failure with `--on-error fail` |
+| 2 | Bad CLI arguments or unreadable input |
+
+### 8.2 Run summary
+
+After processing all files, the tool prints a one-line summary to stderr (or a JSON `info` entry if `--log-json`):
+
+Plain text:
+```
+m2sql: 12 translated, 0 errors, 2 warnings  [1.2s]
+```
+
+JSON:
+```json
+{"level":"info","file":null,"line":null,"code":"SUMMARY","message":"12 translated, 0 errors, 2 warnings","duration_ms":1203}
+```
+
+The summary is suppressed if `--no-color` is set and stdout is not a TTY, allowing clean pipe usage.
+
+### 8.3 Timing
+
+Wall-clock time for the entire run (from first byte of input read to last byte of output written) is included in the summary. Measured with `std::time::Instant` (monotonic). Not included in any SQL output.
+
+---
+
+## 9. Versioning & Stability
+
+### 9.1 Semantic versioning
+
+The project follows [SemVer 2.0](https://semver.org):
+- **Patch** (`1.0.x`): bug fixes, snapshot updates, performance improvements. No new M constructs.
+- **Minor** (`1.x.0`): new M constructs, new SQL dialects, new CLI flags (all additive).
+- **Major** (`x.0.0`): breaking changes to CLI flags, output format, or SQL semantics.
+
+### 9.2 CLI stability promise (from v1.0.0)
+
+- Existing flags are never removed or renamed in a minor release.
+- Output SQL for a given input is stable within a major version (i.e. a patch release will not change correct output, only fix incorrect output).
+- JSON log field names are stable within a major version.
+
+### 9.3 Snapshot lock
+
+The `tests/snapshots/` directory is the source of truth for output stability. Any PR that modifies snapshot content must be labelled `breaking-output` if it changes previously correct output for a supported construct.
+
+---
+
+## 10. CI Pipeline Requirements
+
+The following gates must all pass before a PR can merge:
+
+| Gate | Command | Fail condition |
+|---|---|---|
+| Format | `cargo fmt -- --check` | Any formatting diff |
+| Lint | `cargo clippy -- -D warnings` | Any warning |
+| Tests | `cargo test` | Any test failure |
+| Snapshots | `cargo insta test` | Any unapproved snapshot change |
+| Coverage | `cargo llvm-cov --fail-under-lines 80` | Coverage below threshold |
+| Deny | `cargo deny check` | Licence, advisory, or ban violation |
+| Bench regression | `cargo bench` vs baseline | ≥ 20% slowdown |
+| Binary size | `cargo build --release && ls -la target/release/m2sql*` | Binary > 10 MB |
+| Determinism | Run same input 100×, diff all outputs | Any diff |
+
+CI runs on: `ubuntu-latest`, `windows-latest`, `macos-13` (Intel runner).
+
+---
+
+## Appendix A — NFR Traceability Matrix
+
+| NFR ID | Category | PRD section | Enforced by |
+|---|---|---|---|
+| NFR-PERF-01 | Performance | §3 (CLI) | Criterion bench + CI gate |
+| NFR-PERF-02 | Memory | §3 (CLI) | Manual profiling (v1); Valgrind post-v1 |
+| NFR-REL-01 | Determinism | §2 (Goals) | Determinism CI gate (100 runs) |
+| NFR-REL-02 | Translation fidelity | §6 (M features) | Snapshot tests |
+| NFR-REL-03 | Error isolation | §7 (Error handling) | Integration tests |
+| NFR-SEC-01 | Credential redaction | §5.1 (Resolver) | Unit tests + security-tagged snapshots |
+| NFR-SEC-02 | No code execution | §2 (Goals) | Code review + clippy |
+| NFR-SEC-03 | Path traversal | §3.2 (Output) | Integration test with `../../` query name |
+| NFR-SEC-04 | Input size guard | §5 (Input) | Unit test with 11 MB dummy file |
+| NFR-SEC-05 | Supply chain | §4 (Deps) | `cargo deny check` CI gate |
+| NFR-MAINT-01 | Style | §4 (Project) | `cargo fmt` + `clippy` CI gates |
+| NFR-MAINT-02 | Coverage | §11 (Testing) | `cargo llvm-cov` CI gate |
+| NFR-USE-01 | Error messages | §7 (Errors) | Integration test output assertions |
+| NFR-USE-02 | JSON log format | §3.4 (CLI) | Integration tests with `--log-json` |
+| NFR-COMPAT-01 | Platform targets | §3 (CLI) | CI matrix (ubuntu, windows, macos-13) |
+| NFR-COMPAT-02 | Locale independence | §2 (Goals) | CI runs with `LC_ALL=C` and `LC_ALL=tr_TR` |
+| NFR-DIST-01 | GitHub Releases | §3 (Distribution) | Release workflow |
+| NFR-DIST-02 | Homebrew formula | §3 (Distribution) | Formula `test` block in CI |
+| NFR-DIST-03 | Binary size | §2 (Goals) | Binary size CI gate |
+| NFR-VER-01 | SemVer | §2 (Goals) | Changelog review on PR |
