@@ -300,6 +300,15 @@ fn test_tmdl_table() {
     );
 }
 
+#[test]
+fn test_tmdl_indent_based() {
+    test_fixture(
+        "tmdl_indent.tmdl",
+        "tsql",
+        &["-- [query: D_Agenti]", "dbo.V_PBI_ANAG_AGENTI"],
+    );
+}
+
 // ── Error handling tests ───────────────────────────────────────────
 
 #[test]
