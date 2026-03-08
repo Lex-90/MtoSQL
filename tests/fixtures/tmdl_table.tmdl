@@ -1,0 +1,10 @@
+table Sales
+    partition Sales = m
+        mode: import
+        source = ```
+            let
+                Source = Sql.Database("server", "db"),
+                Sales = Source{[Name="Sales"]}[Data]
+            in
+                Sales
+        ```
