@@ -84,6 +84,8 @@ fn translate_table_function(
         "Table.ExpandTableColumn" => translate_expand_table_column(args, ctx),
         "Table.Group" => translate_group(args, ctx),
         "Table.AddColumn" => translate_add_column(args, ctx),
+        "Table.RemoveColumns" => translate_remove_columns(args, ctx),
+        "Table.Combine" => translate_combine(args, ctx),
         "Table.TransformColumnTypes" => translate_transform_column_types(args, ctx),
         "Sql.Database" => {
             let resolved = resolve_source(&MExpr::FunctionCall {
@@ -635,6 +637,196 @@ fn translate_transform_column_types(args: &[MExpr], ctx: &mut TranslationContext
     });
 
     TableOpResult::Select(stmt)
+}
+
+/// Translate `Table.RemoveColumns(table, {"Col1", "Col2"})` → column exclusion.
+fn translate_remove_columns(args: &[MExpr], ctx: &mut TranslationContext) -> TableOpResult {
+    if args.len() < 2 {
+        return TableOpResult::Raw(ctx.untranslatable(
+            0,
+            "Table.RemoveColumns",
+            "requires 2 arguments",
+        ));
+    }
+
+    let table_ref = get_table_ref(&args[0]);
+    let remove_cols = extract_string_list(&args[1]);
+
+    let mut stmt = SelectStmt::new();
+
+    // Check if we know the full column list for this table
+    let known_cols = ctx.known_columns.get(&table_ref).cloned();
+
+    if let Some(cols) = known_cols {
+        // Emit explicit column list excluding the removed columns
+        let remaining: Vec<String> = cols
+            .into_iter()
+            .filter(|c| !remove_cols.contains(c))
+            .collect();
+        stmt.columns = remaining
+            .iter()
+            .map(|c| SelectCol::Expr {
+                expr: SqlExpr::Column {
+                    table: None,
+                    name: c.clone(),
+                },
+                alias: None,
+            })
+            .collect();
+    } else if ctx.dialect.supports_select_except() {
+        // BigQuery/DuckDB: use SELECT * EXCEPT (col1, col2)
+        ctx.warn(
+            0,
+            "UNKNOWN_COLUMNS",
+            "full column list unknown; RemoveColumns translated as EXCEPT clause",
+            None,
+        );
+        stmt.columns = vec![SelectCol::Except {
+            columns: remove_cols,
+        }];
+    } else {
+        // Dialect doesn't support EXCEPT and column list is unknown
+        let frag = format!(
+            "Table.RemoveColumns({}, {{{}}})",
+            table_ref,
+            remove_cols.join(", ")
+        );
+        let placeholder = ctx.untranslatable(
+            0,
+            &frag,
+            &format!(
+                "RemoveColumns on unknown column set for dialect {}",
+                ctx.dialect.name()
+            ),
+        );
+        stmt.columns = vec![SelectCol::Expr {
+            expr: SqlExpr::Raw(placeholder),
+            alias: None,
+        }];
+    }
+
+    stmt.from = Some(TableRef {
+        schema: None,
+        name: table_ref,
+        alias: None,
+    });
+
+    TableOpResult::Select(stmt)
+}
+
+/// Translate `Table.Combine({Table1, Table2, ...})` → UNION ALL.
+fn translate_combine(args: &[MExpr], ctx: &mut TranslationContext) -> TableOpResult {
+    if args.is_empty() {
+        return TableOpResult::Raw(ctx.untranslatable(
+            0,
+            "Table.Combine",
+            "requires 1 argument (list of tables)",
+        ));
+    }
+
+    let tables = match &args[0] {
+        MExpr::List(items) => items,
+        _ => {
+            return TableOpResult::Raw(ctx.untranslatable(
+                0,
+                "Table.Combine",
+                "argument must be a list of tables",
+            ));
+        }
+    };
+
+    if tables.is_empty() {
+        return TableOpResult::Raw(ctx.untranslatable(
+            0,
+            "Table.Combine",
+            "empty table list",
+        ));
+    }
+
+    // Build UNION ALL: first table becomes the main SELECT, rest go into union_all
+    let mut selects: Vec<SelectStmt> = Vec::new();
+
+    for table_expr in tables {
+        let table_name = match table_expr {
+            MExpr::Identifier(name) => name.clone(),
+            _ => {
+                let frag = format_expr(table_expr);
+                // Non-identifier members are not supported
+                ctx.warn(
+                    0,
+                    "UNRESOLVED_COMBINE_TABLE",
+                    &format!("'{}' is not a valid table reference in Table.Combine", frag),
+                    Some(&frag),
+                );
+                continue;
+            }
+        };
+
+        // Validate: must be a known binding or input file stem
+        let is_known_binding = ctx.known_columns.contains_key(&table_name)
+            || ctx.combine_bindings.contains(&table_name);
+        let is_known_file_stem = ctx.input_file_stems.contains(&table_name);
+
+        if !is_known_binding && !is_known_file_stem {
+            match ctx.on_error {
+                super::context::OnError::Fail => {
+                    ctx.error(
+                        0,
+                        "UNRESOLVED_COMBINE_TABLE",
+                        &format!(
+                            "'{}' is not a binding or a known input file stem",
+                            table_name
+                        ),
+                        Some(&table_name),
+                    );
+                    continue;
+                }
+                super::context::OnError::Comment | super::context::OnError::Warn => {
+                    if ctx.on_error == super::context::OnError::Warn {
+                        ctx.warn(
+                            0,
+                            "UNRESOLVED_COMBINE_TABLE",
+                            &format!(
+                                "'{}' is not a binding or a known input file stem",
+                                table_name
+                            ),
+                            Some(&table_name),
+                        );
+                    }
+                    // Emit a placeholder SELECT for unresolved member
+                    let mut member_stmt = SelectStmt::new();
+                    member_stmt.columns = vec![SelectCol::Expr {
+                        expr: SqlExpr::Raw(format!("/* UNRESOLVED: {} */", table_name)),
+                        alias: None,
+                    }];
+                    selects.push(member_stmt);
+                    continue;
+                }
+            }
+        }
+
+        let mut member_stmt = SelectStmt::new();
+        member_stmt.columns = vec![SelectCol::Wildcard];
+        member_stmt.from = Some(TableRef {
+            schema: None,
+            name: table_name,
+            alias: None,
+        });
+        selects.push(member_stmt);
+    }
+
+    if selects.is_empty() {
+        return TableOpResult::Raw(ctx.untranslatable(
+            0,
+            "Table.Combine",
+            "no valid tables to combine",
+        ));
+    }
+
+    let mut first = selects.remove(0);
+    first.union_all = selects;
+
+    TableOpResult::Select(first)
 }
 
 // Helper functions

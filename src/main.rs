@@ -56,8 +56,16 @@ fn main() {
     let mut name_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
 
+    // Build the set of input file stems for cross-file Table.Combine validation
+    let input_file_stems: std::collections::HashSet<String> = args
+        .input
+        .iter()
+        .map(|p| file_stem_from_path(p))
+        .collect();
+
     if args.input.is_empty() {
-        // Read from stdin
+        // Read from stdin — empty file stems set (only let-bindings are valid combine targets)
+        let empty_stems = std::collections::HashSet::new();
         let mut source = String::new();
         if let Err(e) = io::stdin().read_to_string(&mut source) {
             emit_error(&format!("Failed to read stdin: {}", e), &args);
@@ -71,6 +79,7 @@ fn main() {
             dialect.as_ref(),
             on_error,
             args.inline_singles,
+            &empty_stems,
         ) {
             Ok(result) => {
                 for diag in &result.diagnostics {
@@ -163,6 +172,7 @@ fn main() {
                 dialect.as_ref(),
                 on_error,
                 args.inline_singles,
+                &input_file_stems,
             ) {
                 Ok(result) => {
                     for diag in &result.diagnostics {

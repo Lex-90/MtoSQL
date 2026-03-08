@@ -49,6 +49,11 @@ pub trait Dialect: Send + Sync {
         false
     }
 
+    /// Whether `SELECT * EXCEPT (col1, col2)` syntax is supported.
+    fn supports_select_except(&self) -> bool {
+        false
+    }
+
     /// Top-N syntax style.
     fn top_n_syntax(&self) -> TopNSyntax {
         TopNSyntax::Limit

@@ -43,6 +43,11 @@ pub fn translate_let_to_query(
         }
     }
 
+    // Populate combine_bindings for Table.Combine validation
+    for (name, _) in bindings {
+        ctx.combine_bindings.insert(name.clone());
+    }
+
     // Second pass: identify data source bindings and translate each binding
     for (name, expr) in bindings {
         // Skip NestedJoin bindings that will be absorbed by ExpandTableColumn

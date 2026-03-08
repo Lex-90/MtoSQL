@@ -515,3 +515,103 @@ fn test_section_output_files() {
         "Customers.sql should be created"
     );
 }
+
+// ── Table.RemoveColumns tests ──────────────────────────────────────
+
+#[test]
+fn test_remove_cols_bigquery() {
+    test_fixture(
+        "remove_cols.pq",
+        "bigquery",
+        &["* EXCEPT (InternalCode, AuditTimestamp)"],
+    );
+}
+
+#[test]
+fn test_remove_cols_duckdb() {
+    test_fixture(
+        "remove_cols.pq",
+        "duckdb",
+        &["* EXCEPT (InternalCode, AuditTimestamp)"],
+    );
+}
+
+#[test]
+fn test_remove_cols_tsql_fallback() {
+    // T-SQL doesn't support EXCEPT and column list is unknown, so UNTRANSLATABLE
+    test_fixture("remove_cols.pq", "tsql", &["UNTRANSLATABLE"]);
+}
+
+#[test]
+fn test_remove_cols_postgres_fallback() {
+    // PostgreSQL doesn't support EXCEPT and column list is unknown, so UNTRANSLATABLE
+    test_fixture("remove_cols.pq", "postgres", &["UNTRANSLATABLE"]);
+}
+
+#[test]
+fn test_remove_cols_all_dialects() {
+    for dialect in &["bigquery", "duckdb"] {
+        test_fixture("remove_cols.pq", dialect, &["EXCEPT"]);
+    }
+}
+
+// ── Table.Combine tests ────────────────────────────────────────────
+
+#[test]
+fn test_combine_tables_tsql() {
+    test_fixture(
+        "combine_tables.pq",
+        "tsql",
+        &["UNION ALL", "FROM Orders", "FROM Returns"],
+    );
+}
+
+#[test]
+fn test_combine_tables_all_dialects() {
+    for dialect in &["tsql", "postgres", "bigquery", "snowflake", "duckdb"] {
+        test_fixture("combine_tables.pq", dialect, &["UNION ALL"]);
+    }
+}
+
+#[test]
+fn test_combine_tables_stdin_same_let() {
+    // Table.Combine with same-let bindings should work from stdin
+    m2sql()
+        .args(["--dialect", "tsql", "--stdout"])
+        .write_stdin(
+            r#"let Source = Sql.Database("srv", "db"), A = Source{[Name="A"]}[Data], B = Source{[Name="B"]}[Data], Combined = Table.Combine({A, B}) in Combined"#,
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("UNION ALL"));
+}
+
+#[test]
+fn test_combine_tables_unresolved_warn() {
+    // Table.Combine with an unresolved identifier should emit a warning
+    let mut cmd = m2sql();
+    cmd.args(["--dialect", "tsql", "--stdout", "--on-error", "warn"])
+        .write_stdin(
+            r#"let Source = Sql.Database("srv", "db"), Orders = Source{[Name="Orders"]}[Data], Combined = Table.Combine({Orders, ExternalFeed}) in Combined"#,
+        );
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not a binding or a known input file stem"),
+        "Should warn about unresolved table: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_combine_tables_unresolved_fail() {
+    // Table.Combine with an unresolved identifier under --on-error fail should exit 1
+    m2sql()
+        .args(["--dialect", "tsql", "--stdout", "--on-error", "fail"])
+        .write_stdin(
+            r#"let Source = Sql.Database("srv", "db"), Orders = Source{[Name="Orders"]}[Data], Combined = Table.Combine({Orders, ExternalFeed}) in Combined"#,
+        )
+        .assert()
+        .code(1);
+}
