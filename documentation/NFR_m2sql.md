@@ -1,11 +1,15 @@
 # NFR: `m2sql` — Non-Functional Requirements
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 **Status:** Ready for implementation
 **Companion doc:** `PRD_m2sql.md`
 **Runtime:** Rust (stable toolchain, MSRV 1.75)
 
-> **Changelog from v1.0.0**
+> **Changelog from v1.1.0**
+> - §2.2: Added note on TMDL indentation-based source block parsing fidelity.
+> - Appendix A: Added `NFR-FEAT-03` traceability entry for indentation-based TMDL parsing.
+>
+> **Changelog from v1.0.0 → v1.1.0**
 > - §2.3: Corrected `--on-error fail` error-isolation semantics to match PRD §7 (report-and-exit after all files, not halt-on-first-error).
 > - §7.1: Corrected `rustflags` explanation; clarified actual sources of build reproducibility; added `rust-toolchain.toml` requirement.
 > - §8.2: Fixed incorrect TTY check reference (`stdout` → `stderr`).
@@ -71,6 +75,8 @@ Implementation rules to guarantee this:
 The SQL output must be semantically equivalent to the M expression for all constructs in the v1 feature surface (§6 of PRD). "Semantically equivalent" means: executing the SQL against the same data source that the M query targets must return the same rows and columns (modulo row ordering, which M does not guarantee either).
 
 Fidelity is validated through the snapshot test suite. Any change that modifies a snapshot requires explicit human approval via `cargo insta review`.
+
+**TMDL parsing fidelity:** The TMDL parser must correctly extract M source from both backtick-delimited (`` source = ``` … ``` ``) and indentation-based (`source =` followed by deeper-indented lines) block formats. Indentation-based blocks terminate when a line at the same or lesser indentation level as the `source` keyword is encountered. Both formats must produce identical downstream translation results for the same M code.
 
 ### 2.3 Error isolation
 
@@ -422,3 +428,4 @@ CI runs on: `ubuntu-latest`, `windows-latest`, `macos-13` (Intel runner).
 | NFR-VER-01 | SemVer | §2 (Goals) | Changelog review on PR |
 | NFR-FEAT-01 | `Table.RenameColumns` | §6.9 (PRD) | Snapshot tests (`rename_cols.pq`) |
 | NFR-FEAT-02 | `Table.ExpandTableColumn` | §6.10 (PRD) | Snapshot tests (`nested_join.pq`) |
+| NFR-FEAT-03 | TMDL indentation-based source blocks | §5.2 (PRD) | Integration test (`tmdl_indent.tmdl`) |
