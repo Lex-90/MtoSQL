@@ -1,0 +1,31 @@
+table D_Agenti
+	lineageTag: 75280526-2638-47d8-8c80-10b6156a3977
+	column ID
+		dataType: string
+		isNullable: false
+		sourceProviderType: char
+		displayFolder: - Attributes
+		lineageTag: 01574a2a-5ebf-435c-af97-e40b34fb35c4
+		summarizeBy: none
+		sourceColumn: ID
+		annotation SummarizationSetBy = Automatic
+	column COD_AGENTE
+		dataType: string
+		isNullable: false
+		sourceProviderType: char
+		displayFolder: - Attributes
+		lineageTag: a525bc52-11ab-4513-b1d4-63a3544b6a0e
+		summarizeBy: none
+		sourceColumn: COD_AGENTE
+		annotation SummarizationSetBy = Automatic
+	partition D_Agenti = m
+		mode: import
+		queryGroup: Dimensions
+		source =
+				let
+				    Origine = Sql.Database(sql_server, sql_db),
+				    dbo_V_PBI_ANAG_AGENTI = Origine{[Schema="dbo",Item="V_PBI_ANAG_AGENTI"]}[Data],
+				    #"Rimosse colonne" = Table.RemoveColumns(dbo_V_PBI_ANAG_AGENTI,{"PARTITA_IVA", "COD_SDI", "PEC"})
+				in
+				    #"Rimosse colonne"
+	annotation PBI_ResultType = Table

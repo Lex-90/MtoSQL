@@ -37,7 +37,7 @@ pub fn parse_tmdl(input: &str) -> Result<Vec<(String, MDocument)>, ParseError> {
                 .to_string();
         }
 
-        // Look for source = ``` block
+        // Look for source = ``` block (backtick-delimited)
         if trimmed.starts_with("source") && trimmed.contains("```") {
             // Collect M code until closing ```
             let mut m_code = String::new();
@@ -65,9 +65,54 @@ pub fn parse_tmdl(input: &str) -> Result<Vec<(String, MDocument)>, ParseError> {
                 results.push((table_name, doc));
             }
         }
+        // Look for indentation-based source block: "source =" or "source=\n" followed by indented M code
+        else if trimmed.starts_with("source") && trimmed.ends_with('=') {
+            let source_indent = indent_level(lines[i]);
+            let mut m_code = String::new();
+            i += 1;
+
+            // Collect lines that are indented deeper than the source line
+            while i < lines.len() {
+                let line = lines[i];
+                // Empty lines within the block are preserved
+                if line.trim().is_empty() {
+                    if !m_code.is_empty() {
+                        m_code.push('\n');
+                    }
+                    i += 1;
+                    continue;
+                }
+                let line_indent = indent_level(line);
+                if line_indent <= source_indent {
+                    break;
+                }
+                if !m_code.is_empty() {
+                    m_code.push('\n');
+                }
+                m_code.push_str(line.trim());
+                i += 1;
+            }
+
+            if !m_code.is_empty() {
+                let table_name = if current_table.is_empty() {
+                    "query".to_string()
+                } else {
+                    current_table.clone()
+                };
+                let doc = parse(&m_code)?;
+                results.push((table_name, doc));
+            }
+            // Don't increment i again — we already advanced past the block
+            continue;
+        }
 
         i += 1;
     }
 
     Ok(results)
+}
+
+/// Count leading whitespace characters (tabs count as 1).
+fn indent_level(line: &str) -> usize {
+    line.len() - line.trim_start().len()
 }
