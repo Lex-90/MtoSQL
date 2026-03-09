@@ -9,7 +9,7 @@ use crate::resolver::source::{format_expr, resolve_source};
 #[derive(Debug)]
 pub enum TableOpResult {
     /// A new SELECT statement to use as a CTE.
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
     /// A source table reference (no CTE needed, just FROM).
     SourceTable {
         /// Schema name.
@@ -103,7 +103,7 @@ fn translate_table_function(
                 "{}({})",
                 name,
                 args.iter()
-                    .map(|a| format_expr(a))
+                    .map(format_expr)
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -122,7 +122,7 @@ fn translate_table_function(
                     name: table_ref,
                     alias: None,
                 });
-                TableOpResult::Select(stmt)
+                TableOpResult::Select(Box::new(stmt))
             } else {
                 TableOpResult::Raw(placeholder)
             }
@@ -152,7 +152,7 @@ fn translate_select_rows(args: &[MExpr], ctx: &mut TranslationContext) -> TableO
     });
     stmt.where_clause = Some(condition);
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.SelectColumns(table, {"Col1", "Col2"})` → SELECT cols.
@@ -185,7 +185,7 @@ fn translate_select_columns(args: &[MExpr], ctx: &mut TranslationContext) -> Tab
         alias: None,
     });
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.RenameColumns(table, {{"Old", "New"}, ...})` → SELECT Old AS New.
@@ -257,7 +257,7 @@ fn translate_rename_columns(args: &[MExpr], ctx: &mut TranslationContext) -> Tab
         alias: None,
     });
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.Join` / `Table.NestedJoin` → JOIN.
@@ -302,30 +302,22 @@ fn translate_join(args: &[MExpr], is_nested: bool, ctx: &mut TranslationContext)
     // For anti-joins, add WHERE clause
     let anti_where = match join_kind {
         JoinType::LeftAnti => {
-            if let Some(key) = right_keys.first() {
-                Some(SqlExpr::IsNull {
-                    expr: Box::new(SqlExpr::Column {
-                        table: Some(right_ref.clone()),
-                        name: key.clone(),
-                    }),
-                    negated: false,
-                })
-            } else {
-                None
-            }
+            right_keys.first().map(|key| SqlExpr::IsNull {
+                expr: Box::new(SqlExpr::Column {
+                    table: Some(right_ref.clone()),
+                    name: key.clone(),
+                }),
+                negated: false,
+            })
         }
         JoinType::RightAnti => {
-            if let Some(key) = left_keys.first() {
-                Some(SqlExpr::IsNull {
-                    expr: Box::new(SqlExpr::Column {
-                        table: Some(left_ref.clone()),
-                        name: key.clone(),
-                    }),
-                    negated: false,
-                })
-            } else {
-                None
-            }
+            left_keys.first().map(|key| SqlExpr::IsNull {
+                expr: Box::new(SqlExpr::Column {
+                    table: Some(left_ref.clone()),
+                    name: key.clone(),
+                }),
+                negated: false,
+            })
         }
         _ => None,
     };
@@ -366,7 +358,7 @@ fn translate_join(args: &[MExpr], is_nested: bool, ctx: &mut TranslationContext)
         if let Some(where_clause) = anti_where {
             stmt.where_clause = Some(where_clause);
         }
-        return TableOpResult::Select(stmt);
+        return TableOpResult::Select(Box::new(stmt));
     }
 
     let mut stmt = SelectStmt::new();
@@ -392,7 +384,7 @@ fn translate_join(args: &[MExpr], is_nested: bool, ctx: &mut TranslationContext)
         stmt.where_clause = Some(where_clause);
     }
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.ExpandTableColumn(table, "NestedCol", {"Col1"}, {"Alias1"})`.
@@ -459,7 +451,7 @@ fn translate_expand_table_column(args: &[MExpr], ctx: &mut TranslationContext) -
             on: on_condition,
         }];
 
-        TableOpResult::Select(stmt)
+        TableOpResult::Select(Box::new(stmt))
     } else {
         // Not a join expansion
         let frag = format!(
@@ -523,7 +515,7 @@ fn translate_group(args: &[MExpr], ctx: &mut TranslationContext) -> TableOpResul
         alias: None,
     });
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.AddColumn(table, "NewCol", each <expr>, type)` → computed column.
@@ -574,7 +566,7 @@ fn translate_add_column(args: &[MExpr], ctx: &mut TranslationContext) -> TableOp
         alias: None,
     });
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.TransformColumnTypes(table, {{"Col", type}, ...})` → CAST.
@@ -636,7 +628,7 @@ fn translate_transform_column_types(args: &[MExpr], ctx: &mut TranslationContext
         alias: None,
     });
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.RemoveColumns(table, {"Col1", "Col2"})` → column exclusion.
@@ -711,7 +703,7 @@ fn translate_remove_columns(args: &[MExpr], ctx: &mut TranslationContext) -> Tab
         alias: None,
     });
 
-    TableOpResult::Select(stmt)
+    TableOpResult::Select(Box::new(stmt))
 }
 
 /// Translate `Table.Combine({Table1, Table2, ...})` → UNION ALL.
@@ -826,7 +818,7 @@ fn translate_combine(args: &[MExpr], ctx: &mut TranslationContext) -> TableOpRes
     let mut first = selects.remove(0);
     first.union_all = selects;
 
-    TableOpResult::Select(first)
+    TableOpResult::Select(Box::new(first))
 }
 
 // Helper functions
@@ -842,7 +834,7 @@ fn get_table_ref(expr: &MExpr) -> String {
 /// Extract a list of strings from an M list expression.
 pub fn extract_string_list(expr: &MExpr) -> Vec<String> {
     match expr {
-        MExpr::List(items) => items.iter().map(|i| extract_string(i)).collect(),
+        MExpr::List(items) => items.iter().map(extract_string).collect(),
         _ => vec![extract_string(expr)],
     }
 }
@@ -850,7 +842,7 @@ pub fn extract_string_list(expr: &MExpr) -> Vec<String> {
 /// Extract key columns (may be a single string or a list).
 fn extract_key_columns(expr: &MExpr) -> Vec<String> {
     match expr {
-        MExpr::List(items) => items.iter().map(|i| extract_string(i)).collect(),
+        MExpr::List(items) => items.iter().map(extract_string).collect(),
         MExpr::Literal(MLiteral::Text(s)) => vec![s.clone()],
         MExpr::Identifier(s) => vec![s.clone()],
         _ => vec![extract_string(expr)],

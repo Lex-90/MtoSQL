@@ -188,7 +188,7 @@ fn translate_function_in_expr(name: &str, args: &[MExpr], ctx: &mut TranslationC
             if args.len() >= 2 {
                 let col_expr = translate_expr(&args[0], ctx);
                 let val = extract_string(&args[1]);
-                let case_insensitive = args.get(2).map_or(false, is_ordinal_ignore_case);
+                let case_insensitive = args.get(2).is_some_and(is_ordinal_ignore_case);
                 SqlExpr::Like {
                     expr: Box::new(col_expr),
                     pattern: format!("{}%", escape_like(&val)),
@@ -208,7 +208,7 @@ fn translate_function_in_expr(name: &str, args: &[MExpr], ctx: &mut TranslationC
             if args.len() >= 2 {
                 let col_expr = translate_expr(&args[0], ctx);
                 let val = extract_string(&args[1]);
-                let case_insensitive = args.get(2).map_or(false, is_ordinal_ignore_case);
+                let case_insensitive = args.get(2).is_some_and(is_ordinal_ignore_case);
                 SqlExpr::Like {
                     expr: Box::new(col_expr),
                     pattern: format!("%{}", escape_like(&val)),
@@ -228,7 +228,7 @@ fn translate_function_in_expr(name: &str, args: &[MExpr], ctx: &mut TranslationC
             if args.len() >= 2 {
                 let col_expr = translate_expr(&args[0], ctx);
                 let val = extract_string(&args[1]);
-                let case_insensitive = args.get(2).map_or(false, is_ordinal_ignore_case);
+                let case_insensitive = args.get(2).is_some_and(is_ordinal_ignore_case);
                 SqlExpr::Like {
                     expr: Box::new(col_expr),
                     pattern: format!("%{}%", escape_like(&val)),
@@ -325,7 +325,7 @@ fn translate_function_in_expr(name: &str, args: &[MExpr], ctx: &mut TranslationC
                 "{}({})",
                 name,
                 args.iter()
-                    .map(|a| format_expr(a))
+                    .map(format_expr)
                     .collect::<Vec<_>>()
                     .join(", ")
             );

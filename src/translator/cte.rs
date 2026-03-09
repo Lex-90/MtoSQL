@@ -98,7 +98,7 @@ pub fn translate_let_to_query(
                 if !should_inline {
                     ctes.push(Cte {
                         name: sanitize_cte_name(name),
-                        select: stmt,
+                        select: *stmt,
                     });
                 }
             }
@@ -263,7 +263,7 @@ enum BindingResult {
         table: String,
     },
     /// A table operation (SELECT statement).
-    TableOp(SelectStmt),
+    TableOp(Box<SelectStmt>),
     /// A scalar binding (not a CTE).
     Scalar,
     /// An alias/reference to another binding.
@@ -333,7 +333,7 @@ pub fn sanitize_cte_name(name: &str) -> String {
     if result.is_empty() {
         result = "cte".to_string();
     }
-    if result.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+    if result.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         result = format!("_{}", result);
     }
     result
