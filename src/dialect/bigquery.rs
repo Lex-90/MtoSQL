@@ -30,6 +30,14 @@ impl Dialect for BigQuery {
         "CURRENT_TIMESTAMP()"
     }
 
+    fn supports_try_cast(&self) -> bool {
+        true
+    }
+
+    fn try_cast_syntax(&self, expr: &str, ty: &str) -> Option<String> {
+        Some(format!("SAFE_CAST({} AS {})", expr, ty))
+    }
+
     fn map_type(&self, m_type: &MType) -> &'static str {
         match m_type {
             MType::Text => "STRING",

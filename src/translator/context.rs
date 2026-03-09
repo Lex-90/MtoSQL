@@ -1,6 +1,7 @@
 /// Translation context — holds dialect, error mode, and accumulated diagnostics.
 use crate::dialect::Dialect;
 use crate::error::{DiagLevel, Diagnostic};
+use crate::resolver::source::DetectedParameter;
 
 /// Error handling mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,8 @@ pub struct TranslationContext<'a> {
     pub combine_bindings: std::collections::HashSet<String>,
     /// Set of input file stems from CLI arguments (for cross-file Table.Combine validation).
     pub input_file_stems: std::collections::HashSet<String>,
+    /// Detected Power Query parameters for the current file.
+    pub detected_params: indexmap::IndexMap<String, DetectedParameter>,
 }
 
 /// Information about a nested join for ExpandTableColumn resolution.
@@ -76,6 +79,7 @@ impl<'a> TranslationContext<'a> {
             nested_joins: indexmap::IndexMap::new(),
             combine_bindings: std::collections::HashSet::new(),
             input_file_stems: std::collections::HashSet::new(),
+            detected_params: indexmap::IndexMap::new(),
         }
     }
 

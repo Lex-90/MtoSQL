@@ -48,6 +48,47 @@ pub fn translate_let_to_query(
         ctx.combine_bindings.insert(name.clone());
     }
 
+    // Pre-scan: record type coercion context from TransformColumnTypes for ReplaceErrorValues
+    for (name, expr) in bindings {
+        if let MExpr::FunctionCall {
+            name: fn_name,
+            args,
+        } = expr
+        {
+            if fn_name == "Table.TransformColumnTypes" && args.len() >= 2 {
+                // Validate first arg is an identifier (table reference)
+                if !matches!(&args[0], MExpr::Identifier(_)) {
+                    continue;
+                }
+                if let MExpr::List(type_specs) = &args[1] {
+                    for spec in type_specs {
+                        if let MExpr::List(items) = spec {
+                            if items.len() >= 2 {
+                                let col_name = super::expr::extract_string(&items[0]);
+                                let m_type = match &items[1] {
+                                    MExpr::Identifier(tn) => {
+                                        super::cast::resolve_m_type(tn)
+                                    }
+                                    _ => continue,
+                                };
+                                let sql_type = ctx.dialect.map_type(&m_type);
+                                if !sql_type.contains("UNSUPPORTED") {
+                                    // Record: binding_name has a type coercion for col_name
+                                    ctx.known_columns
+                                        .entry(format!("{}_types", name))
+                                        .or_insert_with(Vec::new)
+                                        .push(col_name.clone());
+                                    ctx.known_columns
+                                        .insert(format!("{}_{}_type", name, col_name), vec![sql_type.to_string()]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Second pass: identify data source bindings and translate each binding
     for (name, expr) in bindings {
         // Skip NestedJoin bindings that will be absorbed by ExpandTableColumn

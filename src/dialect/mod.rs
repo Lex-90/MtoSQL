@@ -76,6 +76,21 @@ pub trait Dialect: Send + Sync {
     /// Map an M type to the corresponding SQL type string.
     fn map_type(&self, m_type: &MType) -> &'static str;
 
+    /// Whether this dialect supports error-safe casting (TRY_CAST or equivalent).
+    fn supports_try_cast(&self) -> bool {
+        false
+    }
+
+    /// Generate an error-safe cast expression (TRY_CAST, SAFE_CAST, etc.).
+    /// Returns None if the dialect does not support error-safe casting.
+    fn try_cast_syntax(&self, expr: &str, ty: &str) -> Option<String> {
+        if self.supports_try_cast() {
+            Some(format!("TRY_CAST({} AS {})", expr, ty))
+        } else {
+            None
+        }
+    }
+
     /// Quote an identifier.
     fn quote_identifier(&self, name: &str) -> String {
         format!(

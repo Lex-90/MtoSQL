@@ -13,10 +13,17 @@ pub fn translate_expr(expr: &MExpr, ctx: &mut TranslationContext) -> SqlExpr {
             // Check for well-known M constants
             match name.as_str() {
                 "_" => SqlExpr::Raw("*".to_string()),
-                _ => SqlExpr::Column {
-                    table: None,
-                    name: name.clone(),
-                },
+                _ => {
+                    // Check if this identifier is a detected Power Query parameter
+                    if ctx.detected_params.contains_key(name) {
+                        SqlExpr::Raw(format!("/* PARAM: {} */", name))
+                    } else {
+                        SqlExpr::Column {
+                            table: None,
+                            name: name.clone(),
+                        }
+                    }
+                }
             }
         }
 
