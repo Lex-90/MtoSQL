@@ -1,10 +1,19 @@
 # NFR: `m2sql` — Non-Functional Requirements
 
-**Version:** 1.3.0
+**Version:** 1.5.0
 **Status:** Ready for implementation
 **Companion doc:** `PRD_m2sql.md`
 **Runtime:** Rust (stable toolchain, MSRV 1.75)
 
+> **Changelog from v1.4.0**
+> - §2.7: New — Power Query parameter non-suppressibility and run-summary extension requirements.
+> - §8.2: Extended run-summary format to include `parameters detected` count.
+> - Appendix A: Added `NFR-FEAT-07` traceability entry for Power Query parameter detection.
+>
+> **Changelog from v1.3.0**
+> - §2.6: New — Dialect-specific error-trapping fidelity requirement for `Table.ReplaceErrorValues`: `postgres` approximate-translation warning is a required diagnostic, not optional.
+> - Appendix A: Added `NFR-FEAT-06` traceability entry for `Table.ReplaceErrorValues`.
+>
 > **Changelog from v1.2.0**
 > - §2.5: New — Cross-file reference validation for `Table.Combine`: resolver must hold input file stems until all files are parsed before running the combine-table resolution pass.
 > - Appendix A: Added `NFR-FEAT-04` (`Table.RemoveColumns`) and `NFR-FEAT-05` (`Table.Combine`) traceability entries.
@@ -109,6 +118,25 @@ Silently dropping steps or columns is never acceptable.
 - When reading from stdin, the input-file stem set is empty; only same-`let` bindings are valid combine targets.
 
 **Determinism note:** The set of valid file stems must be sorted lexicographically before the validation pass to ensure identical error ordering regardless of filesystem enumeration order (per `§2.1`).
+
+### 2.6 Dialect-specific error-trapping fidelity (`Table.ReplaceErrorValues`)
+
+`Table.ReplaceErrorValues` cannot be translated with equal fidelity across all five dialects because PostgreSQL has no native `TRY_CAST` equivalent. The following rules are **mandatory**, not advisory:
+
+- For `tsql`, `snowflake`, and `duckdb`: the `TRY_CAST`-based translation must be used whenever a preceding coercion context is present. Falling back to a plain `COALESCE(col, replacement)` when a coercion context is available is a translation fidelity failure.
+- For `bigquery`: `SAFE_CAST` must be used; `TRY_CAST` is not valid BigQuery syntax and must never be emitted.
+- For `postgres`: the plain `COALESCE(col, replacement)` translation is the **only** permitted output. The translator **must** emit a `WARN`-level diagnostic (`REPLACE_ERROR_APPROXIMATE`) for every affected column in the postgres dialect, regardless of `--on-error` mode. This warning cannot be suppressed — it informs the user that the SQL semantics differ from M semantics (non-null error values will not be caught). This is a named exception to the general rule that `warn` mode warnings can be silenced.
+- When no preceding coercion context exists (Case 2 in PRD §6.13), the `CASE WHEN … IS NULL` fallback is permitted for all dialects, but the `WARN` diagnostic is still required.
+
+### 2.7 Power Query parameter detection — non-suppressibility and summary integrity
+
+Power Query parameters produce SQL output that is **never directly executable** — the `/* PARAM: … */` placeholders are syntactically invalid in all five target dialects. The following rules are therefore mandatory:
+
+- The `PARAM_REFERENCE` warning must be emitted for each unique parameter name per file regardless of `--on-error` mode, `--no-color`, or any other CLI flag. There is no flag that suppresses it. This is a named exception to the general rule that warning volume can be controlled by the user.
+- The parameter header block (PRD §6.14) must be present in every `.sql` output file that contains at least one `/* PARAM: … */` placeholder. Omitting the header block when parameters are present is a reliability failure.
+- **Determinism of the header block:** The parameter list in the header block must be sorted lexicographically and must include the file name and 1-indexed line number of the first use of each parameter. Because the order must be independent of AST traversal order, the `detect_parameters` pass must collect all parameter use sites into an `IndexMap<String, (file, line)>` keyed on parameter name, then sort by key before emitting. This satisfies `§2.1` (determinism).
+- **No false positives:** The `detect_parameters` pass must maintain a deny-list of all M built-in identifiers, all `let` bindings in scope (including outer scopes for nested `let`), and all input file stems. Any identifier on this list must never be emitted as a `PARAM_REFERENCE`. False positives (classifying a bound variable as a parameter) are a translation fidelity failure per `§2.2`.
+- **Run summary integrity:** The `params_detected` count in the run summary (plain text and JSON) must equal the total number of **unique** parameter names found across **all** input files in the run (not the total number of use sites). If a parameter named `sql_server` appears in three different input files, it contributes 3 to the count (one per file-scope detection), not 1. This matches the semantics of the per-file `PARAM_REFERENCE` warning count.
 
 ---
 
@@ -358,15 +386,27 @@ Release binary (stripped) must be ≤ 10 MB on all three Tier 1 targets. Enforce
 
 After processing all files, the tool prints a one-line summary to stderr (or a JSON `info` entry if `--log-json`):
 
-Plain text:
+Plain text (no parameters detected):
 ```
 m2sql: 12 translated, 0 errors, 2 warnings  [1.2s]
 ```
 
-JSON:
+Plain text (with parameters detected):
+```
+m2sql: 3 translated, 0 errors, 0 warnings, 2 parameters detected  [0.8s]
+```
+
+JSON (no parameters):
 ```json
 {"level":"info","file":null,"line":null,"code":"SUMMARY","message":"12 translated, 0 errors, 2 warnings","duration_ms":1203}
 ```
+
+JSON (with parameters):
+```json
+{"level":"info","file":null,"line":null,"code":"SUMMARY","message":"3 translated, 0 errors, 0 warnings, 2 parameters detected","params_detected":2,"duration_ms":812}
+```
+
+The `params_detected` field is omitted from the JSON object when its value is 0 (to keep the common case compact). The plain-text `parameters detected` segment is likewise omitted when the count is 0.
 
 The summary is suppressed if `--no-color` is set and **stderr** is not a TTY, allowing clean pipe usage. (Note: the summary is written to stderr, so the TTY check is correctly performed on stderr, not stdout.)
 
@@ -449,3 +489,5 @@ CI runs on: `ubuntu-latest`, `windows-latest`, `macos-13` (Intel runner).
 | NFR-FEAT-03 | TMDL indentation-based source blocks | §5.2 (PRD) | Integration test (`tmdl_indent.tmdl`) |
 | NFR-FEAT-04 | `Table.RemoveColumns` | §6.11 (PRD) | Snapshot tests (`remove_cols.pq`); dialect matrix covering `bigquery`/`duckdb` (`EXCEPT`) and `tsql`/`postgres`/`snowflake` (explicit projection); fallback warning test for unknown column set |
 | NFR-FEAT-05 | `Table.Combine` cross-file validation | §6.12 (PRD) | Integration tests (`combine_tables.pq`): (a) same-`let` bindings only; (b) valid cross-file reference to `Customers.pq`; (c) unresolved identifier → `UNRESOLVED_COMBINE_TABLE` error; (d) stdin mode → only `let` bindings accepted |
+| NFR-FEAT-06 | `Table.ReplaceErrorValues` dialect fidelity | §6.13 (PRD) | Snapshot tests (`replace_error_values.pq`): (a) `tsql`/`snowflake`/`duckdb` → `TRY_CAST` path with coercion context; (b) `bigquery` → `SAFE_CAST` path; (c) `postgres` → `COALESCE` approximation + mandatory `REPLACE_ERROR_APPROXIMATE` warning always present in output; (d) no-coercion-context path → `CASE WHEN IS NULL` + warning for all dialects; (e) non-literal replacement → `UNTRANSLATABLE` |
+| NFR-FEAT-07 | Power Query parameter detection | §6.14 (PRD) | Integration tests (`pq_parameters.pq`): (a) server/db args → `/* PARAM: … */` in FROM clause; (b) record-selector name → `/* PARAM: … */` in table reference; (c) filter condition value → `/* PARAM: … */` in WHERE clause; (d) parameter header block present and lexicographically sorted; (e) `PARAM_REFERENCE` warning emitted for each unique parameter regardless of `--on-error` mode (verified with all three modes); (f) no false positives — bound `let` vars, M keywords, and input file stems are not flagged; (g) run summary `params_detected` count is correct; (h) `--log-json` includes `"params_detected"` field only when > 0 |
