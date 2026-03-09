@@ -1,4 +1,4 @@
-/// AST node types for M expressions.
+//! AST node types for M expressions.
 
 /// Top-level M document — either a single expression or a section with bindings.
 #[derive(Debug, Clone, PartialEq)]

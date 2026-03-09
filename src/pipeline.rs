@@ -26,6 +26,7 @@ pub fn process_source(
     dialect: &dyn Dialect,
     on_error: OnError,
     inline_singles: bool,
+    input_file_stems: &std::collections::HashSet<String>,
 ) -> Result<ProcessResult, M2SqlError> {
     // Parse
     let is_tmdl = file_name.ends_with(".tmdl");
@@ -51,6 +52,7 @@ pub fn process_source(
 
     for (query_name, doc) in &documents {
         let mut ctx = TranslationContext::new(dialect, on_error, file_name, inline_singles);
+        ctx.input_file_stems = input_file_stems.clone();
 
         // Translate
         let results = translator::translate(doc, query_name, &mut ctx);

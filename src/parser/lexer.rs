@@ -1,4 +1,4 @@
-/// M language tokeniser.
+//! M language tokeniser.
 
 /// Token types for the M lexer.
 #[derive(Debug, Clone, PartialEq)]

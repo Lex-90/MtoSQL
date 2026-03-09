@@ -18,6 +18,10 @@ impl Dialect for BigQuery {
         false
     }
 
+    fn supports_select_except(&self) -> bool {
+        true
+    }
+
     fn top_n_syntax(&self) -> TopNSyntax {
         TopNSyntax::Limit
     }

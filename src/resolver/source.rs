@@ -56,7 +56,7 @@ pub fn resolve_source(expr: &MExpr) -> ResolvedSource {
         MExpr::FunctionCall { name, .. } if name == "Excel.Workbook" => ResolvedSource {
             schema: None,
             table: None,
-            raw: Some(format!("Excel.Workbook(...)")),
+            raw: Some("Excel.Workbook(...)".to_string()),
         },
         _ => ResolvedSource {
             schema: None,
@@ -118,7 +118,7 @@ pub fn format_expr(expr: &MExpr) -> String {
         MExpr::Literal(MLiteral::Bool(b)) => b.to_string(),
         MExpr::Literal(MLiteral::Null) => "null".to_string(),
         MExpr::FunctionCall { name, args } => {
-            let args_str: Vec<String> = args.iter().map(|a| format_expr(a)).collect();
+            let args_str: Vec<String> = args.iter().map(format_expr).collect();
             format!("{}({})", name, args_str.join(", "))
         }
         MExpr::FieldAccess { expr, field } => format!("{}[{}]", format_expr(expr), field),
@@ -152,7 +152,7 @@ pub fn format_expr(expr: &MExpr) -> String {
             format!("{}{}", op_str, format_expr(expr))
         }
         MExpr::List(items) => {
-            let items_str: Vec<String> = items.iter().map(|i| format_expr(i)).collect();
+            let items_str: Vec<String> = items.iter().map(format_expr).collect();
             format!("{{{}}}", items_str.join(", "))
         }
         MExpr::Record(fields) => {

@@ -22,6 +22,10 @@ impl Dialect for DuckDb {
         true
     }
 
+    fn supports_select_except(&self) -> bool {
+        true
+    }
+
     fn top_n_syntax(&self) -> TopNSyntax {
         TopNSyntax::Limit
     }
