@@ -34,6 +34,10 @@ impl Dialect for DuckDb {
         "now()"
     }
 
+    fn supports_try_cast(&self) -> bool {
+        true
+    }
+
     fn map_type(&self, m_type: &MType) -> &'static str {
         match m_type {
             MType::Text => "VARCHAR",

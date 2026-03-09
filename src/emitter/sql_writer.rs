@@ -190,6 +190,27 @@ pub enum SqlExpr {
         /// Whether this is IS NOT NULL.
         negated: bool,
     },
+    /// A TRY_CAST / SAFE_CAST expression (error-safe cast).
+    TryCast {
+        /// The expression to cast.
+        expr: Box<SqlExpr>,
+        /// Target type.
+        ty: String,
+    },
+    /// A CASE WHEN expression.
+    CaseWhen {
+        /// Condition.
+        condition: Box<SqlExpr>,
+        /// THEN expression.
+        then_expr: Box<SqlExpr>,
+        /// ELSE expression.
+        else_expr: Box<SqlExpr>,
+    },
+    /// A COALESCE expression.
+    Coalesce {
+        /// Arguments.
+        args: Vec<SqlExpr>,
+    },
     /// Raw SQL string (escape hatch).
     Raw(String),
     /// Parenthesized expression.
@@ -532,6 +553,30 @@ pub fn write_expr(expr: &SqlExpr, dialect: &dyn Dialect) -> String {
             } else {
                 format!("{} IS NULL", write_expr(expr, dialect))
             }
+        }
+        SqlExpr::TryCast { expr, ty } => {
+            if let Some(try_cast) = dialect.try_cast_syntax(&write_expr(expr, dialect), ty) {
+                try_cast
+            } else {
+                // Fallback to regular CAST if dialect doesn't support TRY_CAST
+                dialect.cast_syntax(&write_expr(expr, dialect), ty)
+            }
+        }
+        SqlExpr::CaseWhen {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            format!(
+                "CASE WHEN {} THEN {} ELSE {} END",
+                write_expr(condition, dialect),
+                write_expr(then_expr, dialect),
+                write_expr(else_expr, dialect)
+            )
+        }
+        SqlExpr::Coalesce { args } => {
+            let args_str: Vec<String> = args.iter().map(|a| write_expr(a, dialect)).collect();
+            format!("COALESCE({})", args_str.join(", "))
         }
         SqlExpr::Raw(s) => s.clone(),
         SqlExpr::Parens(inner) => {

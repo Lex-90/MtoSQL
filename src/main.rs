@@ -52,6 +52,7 @@ fn main() {
     let mut total_translated = 0usize;
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
+    let mut total_params_detected = 0usize;
     let mut any_translation_errors = false;
     let mut name_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -90,6 +91,8 @@ fn main() {
                         _ => {}
                     }
                 }
+
+                total_params_detected += result.params_detected;
 
                 if result.has_errors {
                     any_translation_errors = true;
@@ -184,6 +187,8 @@ fn main() {
                         }
                     }
 
+                    total_params_detected += result.params_detected;
+
                     if result.has_errors {
                         any_translation_errors = true;
                         // With --on-error fail, still process all files but don't write errored ones
@@ -224,15 +229,26 @@ fn main() {
     let elapsed = start.elapsed();
 
     // Print summary
+    let params_segment = if total_params_detected > 0 {
+        format!(", {} parameters detected", total_params_detected)
+    } else {
+        String::new()
+    };
     let summary_msg = format!(
-        "{} translated, {} errors, {} warnings",
-        total_translated, total_errors, total_warnings
+        "{} translated, {} errors, {} warnings{}",
+        total_translated, total_errors, total_warnings, params_segment
     );
 
     if args.log_json {
+        let params_field = if total_params_detected > 0 {
+            format!(",\"params_detected\":{}", total_params_detected)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{{\"level\":\"info\",\"file\":null,\"line\":null,\"code\":\"SUMMARY\",\"message\":\"{}\",\"duration_ms\":{}}}",
+            "{{\"level\":\"info\",\"file\":null,\"line\":null,\"code\":\"SUMMARY\",\"message\":\"{}\"{},\"duration_ms\":{}}}",
             summary_msg,
+            params_field,
             elapsed.as_millis()
         );
     } else {

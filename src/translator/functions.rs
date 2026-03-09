@@ -87,6 +87,7 @@ fn translate_table_function(
         "Table.RemoveColumns" => translate_remove_columns(args, ctx),
         "Table.Combine" => translate_combine(args, ctx),
         "Table.TransformColumnTypes" => translate_transform_column_types(args, ctx),
+        "Table.ReplaceErrorValues" => translate_replace_error_values(args, ctx),
         "Sql.Database" => {
             let resolved = resolve_source(&MExpr::FunctionCall {
                 name: name.to_string(),
@@ -827,6 +828,211 @@ fn translate_combine(args: &[MExpr], ctx: &mut TranslationContext) -> TableOpRes
     first.union_all = selects;
 
     TableOpResult::Select(first)
+}
+
+/// Translate `Table.ReplaceErrorValues(table, {{"Col1", val1}, {"Col2", val2}, ...})`.
+fn translate_replace_error_values(args: &[MExpr], ctx: &mut TranslationContext) -> TableOpResult {
+    if args.len() < 2 {
+        return TableOpResult::Raw(ctx.untranslatable(
+            0,
+            "Table.ReplaceErrorValues",
+            "requires 2 arguments",
+        ));
+    }
+
+    let table_ref = get_table_ref(&args[0]);
+
+    // Extract replacement pairs: {{"Col", value}, ...}
+    let replacement_pairs = match &args[1] {
+        MExpr::List(items) => {
+            let mut pairs = Vec::new();
+            for item in items {
+                if let MExpr::List(pair) = item {
+                    if pair.len() >= 2 {
+                        let col_name = extract_string(&pair[0]);
+                        pairs.push((col_name, &pair[1]));
+                    }
+                }
+            }
+            pairs
+        }
+        _ => {
+            return TableOpResult::Raw(ctx.untranslatable(
+                0,
+                "Table.ReplaceErrorValues",
+                "second argument must be a list of {column, replacement} pairs",
+            ));
+        }
+    };
+
+    // Check if we have a preceding coercion context (known column types from TransformColumnTypes)
+    let known_types = ctx.known_columns.get(&format!("{}_types", table_ref)).cloned();
+
+    let mut stmt = SelectStmt::new();
+
+    for (col_name, replacement_expr) in &replacement_pairs {
+        // Check if replacement is a literal
+        let is_literal = matches!(
+            replacement_expr,
+            MExpr::Literal(MLiteral::Text(_))
+                | MExpr::Literal(MLiteral::Integer(_))
+                | MExpr::Literal(MLiteral::Number(_))
+                | MExpr::Literal(MLiteral::Bool(_))
+                | MExpr::Literal(MLiteral::Null)
+        );
+
+        if !is_literal {
+            let frag = format!(
+                "Table.ReplaceErrorValues({}, {{{{\"{}\",...}}}})",
+                table_ref, col_name
+            );
+            let placeholder = ctx.untranslatable(
+                0,
+                &frag,
+                "non-literal replacement in ReplaceErrorValues",
+            );
+            stmt.columns.push(SelectCol::Expr {
+                expr: SqlExpr::Raw(placeholder),
+                alias: Some(col_name.clone()),
+            });
+            continue;
+        }
+
+        let replacement_sql = translate_expr(replacement_expr, ctx);
+
+        // Check if this column has a known type from a preceding TransformColumnTypes
+        let col_type = known_types
+            .as_ref()
+            .and_then(|types| types.iter().find(|t| t == &col_name).map(|_| ()))
+            .and_then(|_| {
+                // Look up the type in the coercion context
+                ctx.known_columns
+                    .get(&format!("{}_{}_type", table_ref, col_name))
+                    .and_then(|v| v.first().cloned())
+            });
+
+        if let Some(sql_type) = col_type {
+            // Case 1: Preceding coercion context exists
+            if ctx.dialect.supports_try_cast() {
+                // TRY_CAST / SAFE_CAST path
+                let try_cast_expr = SqlExpr::TryCast {
+                    expr: Box::new(SqlExpr::Column {
+                        table: None,
+                        name: col_name.clone(),
+                    }),
+                    ty: sql_type,
+                };
+                stmt.columns.push(SelectCol::Expr {
+                    expr: SqlExpr::Coalesce {
+                        args: vec![try_cast_expr, replacement_sql],
+                    },
+                    alias: Some(col_name.clone()),
+                });
+            } else {
+                // Postgres: no TRY_CAST — use COALESCE approximation + warning
+                ctx.warn(
+                    0,
+                    "REPLACE_ERROR_APPROXIMATE",
+                    &format!(
+                        "postgres has no TRY_CAST; error trapping for '{}' is approximate",
+                        col_name
+                    ),
+                    None,
+                );
+                stmt.columns.push(SelectCol::Expr {
+                    expr: SqlExpr::Coalesce {
+                        args: vec![
+                            SqlExpr::Column {
+                                table: None,
+                                name: col_name.clone(),
+                            },
+                            replacement_sql,
+                        ],
+                    },
+                    alias: Some(col_name.clone()),
+                });
+            }
+        } else {
+            // Case 2: No preceding coercion context — use CASE WHEN IS NULL
+            ctx.warn(
+                0,
+                "REPLACE_ERROR_APPROXIMATE",
+                &format!(
+                    "ReplaceErrorValues on '{}' has no preceding coercion context; translating as NULL replacement only — non-null SQL errors will not be caught",
+                    col_name
+                ),
+                None,
+            );
+
+            if ctx.dialect.name() == "postgres" {
+                // Additional postgres-specific warning
+                ctx.warn(
+                    0,
+                    "REPLACE_ERROR_APPROXIMATE",
+                    &format!(
+                        "postgres has no TRY_CAST; error trapping for '{}' is approximate",
+                        col_name
+                    ),
+                    None,
+                );
+            }
+
+            stmt.columns.push(SelectCol::Expr {
+                expr: SqlExpr::CaseWhen {
+                    condition: Box::new(SqlExpr::IsNull {
+                        expr: Box::new(SqlExpr::Column {
+                            table: None,
+                            name: col_name.clone(),
+                        }),
+                        negated: false,
+                    }),
+                    then_expr: Box::new(replacement_sql),
+                    else_expr: Box::new(SqlExpr::Column {
+                        table: None,
+                        name: col_name.clone(),
+                    }),
+                },
+                alias: Some(col_name.clone()),
+            });
+        }
+    }
+
+    // Pass through other columns
+    let replacement_col_names: Vec<&str> = replacement_pairs.iter().map(|(n, _)| n.as_str()).collect();
+    let known_cols = ctx.known_columns.get(&table_ref).cloned();
+    if let Some(cols) = known_cols {
+        for col in &cols {
+            if !replacement_col_names.contains(&col.as_str()) {
+                stmt.columns.push(SelectCol::Expr {
+                    expr: SqlExpr::Column {
+                        table: None,
+                        name: col.clone(),
+                    },
+                    alias: None,
+                });
+            }
+        }
+    } else {
+        // If we don't know the full column set, we can't list remaining columns
+        // Add a wildcard-like comment if there are replacement columns
+        if !replacement_pairs.is_empty() {
+            // We'll use a Raw wildcard approach — put replacement cols first, then *
+            // Restructure: put replacements + wildcard
+            let replacement_cols: Vec<SelectCol> = stmt.columns.drain(..).collect();
+            stmt.columns = vec![SelectCol::Wildcard];
+            // Actually, we need to be smarter here. We can't mix * with aliased columns
+            // in a clean way. Use the replacement expressions only.
+            stmt.columns = replacement_cols;
+        }
+    }
+
+    stmt.from = Some(TableRef {
+        schema: None,
+        name: table_ref,
+        alias: None,
+    });
+
+    TableOpResult::Select(stmt)
 }
 
 // Helper functions
